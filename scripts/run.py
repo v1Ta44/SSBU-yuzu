@@ -24,6 +24,13 @@ import os
 import shutil
 import subprocess
 import sys
+try:
+    from .player_name import game_name
+    from .network_launch import configure_network
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from player_name import game_name
+    from network_launch import configure_network
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,8 +51,40 @@ def ini_on(path, key):
     return False
 
 
+def copy_feature_record(source, target):
+    source = os.path.splitext(source)[0] + '.build.json'
+    target = os.path.splitext(target)[0] + '.build.json'
+    if os.path.isfile(source):
+        shutil.copy2(source, target)
+    elif os.path.isfile(target):
+        os.remove(target)
+
+
+def exclude_cpus(cpus):
+    """Take logical processors out of this process's affinity; the game started from here inherits it (Windows only)."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+    k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+    proc, system = ctypes.c_size_t(), ctypes.c_size_t()
+    me = k32.GetCurrentProcess()
+    if not k32.GetProcessAffinityMask(me, ctypes.byref(proc), ctypes.byref(system)):
+        sys.exit('GetProcessAffinityMask failed: %d' % ctypes.get_last_error())
+    mask = proc.value
+    for n in cpus:
+        mask &= ~(1 << n)
+    if not mask:
+        sys.exit('--exclude-cpus leaves no processor to run on')
+    if not k32.SetProcessAffinityMask(me, mask):
+        sys.exit('SetProcessAffinityMask failed: %d' % ctypes.get_last_error())
+    print('affinity: logical processors %s left out (mask %x)' % (','.join(map(str, cpus)), mask))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--nickname', help='Game identity; defaults to the name saved on the Console Start page')
     ap.add_argument('--userdata', help='the save folder (required, except with --play)')
     ap.add_argument('--play', action='store_true', help='what "Play SSBU.bat" does: the saves in <build>\\saves, until you quit; '
                                                         'a plain message when the game is not built yet')
@@ -59,6 +98,8 @@ def main():
     ap.add_argument('--seed', help='SSBU_FIXED_SEED value (deterministic random numbers)')
     ap.add_argument('--log', help='write the game output to this file instead of the console')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE, may be repeated')
+    ap.add_argument('--exclude-cpus', help='comma list of logical processors the game must not run on (e.g. 8,9 for a core '
+                                           'that reports machine-check errors); the game inherits the affinity of this script')
     ap.add_argument('--mac', action='store_true', help='the native macOS build (default build folder build-macos, exe ssbu_native, '
                                                       'saves in ~/Library/Application Support/ssbu-recomp/userdata unless --userdata)')
     a = ap.parse_args()
@@ -120,25 +161,28 @@ def main():
             ap.error('--userdata is required (or --play)')
     main_exe = 'ssbu_native' if (a.linux or a.mac) else 'ssbu_native.exe'
     a.exe = a.exe or main_exe
+    identity_override = next((v.partition('=')[2] for v in reversed(a.env) if v.partition('=')[0].upper() == 'SSBU_NICKNAME'), None)
+    try:
+        player = game_name(a.build, a.nickname if a.nickname is not None else identity_override)
+    except ValueError as error:
+        ap.error(str(error))
+    if a.exclude_cpus:
+        exclude_cpus([int(x) for x in a.exclude_cpus.split(',') if x.strip()])
     state_file = os.path.join(a.build, 'state.json')
     with open(state_file) as f:
         state = json.load(f)
     work = os.path.join(a.build, 'work')
-    rollback = False
-    if a.play and a.exe == main_exe and not (a.linux or a.mac) and ini_on(os.path.join(a.build, 'config', 'graphics.ini'), 'rollback'):
-        # F1 > Experimental > Rollback netcode: the normal exe and game DLL with SSBU_RB_NET (since R4 the ring saves the fight on
-        # the normal build: runtime/rb_learned.c); the old pair ssbu_native_rb.exe + ssbu_game_r1.dll of an older install is not used
-        rollback = True
-        print('Rollback netcode on (the normal build; no second compile needed)')
     exe = os.path.join(work, a.exe)
     native = os.path.join(work, main_exe)
     if not os.path.exists(exe):
         shutil.copy2(native, exe)
+        copy_feature_record(native, exe)
     elif exe != native and os.path.getmtime(exe) < os.path.getmtime(native):
         # a copy made before the last link runs the old runtime; an exe linked on purpose with other sources
         # (RECOMP_EXE) is older too, so it is only replaced when asked
         if a.refresh:
             shutil.copy2(native, exe)
+            copy_feature_record(native, exe)
             print('%s was older than %s: copied again' % (a.exe, main_exe))
         else:
             print('note: %s is older than %s and may run an older runtime (--refresh copies it again)' % (a.exe, main_exe))
@@ -177,8 +221,6 @@ def main():
             env['SSBU_SEQ'] = ' '.join(l.strip() for l in f if l.strip() and not l.startswith('#'))
     if a.seed:
         env['SSBU_FIXED_SEED'] = a.seed
-    if rollback and 'SSBU_RB_NET' not in env:
-        env['SSBU_RB_NET'] = 'net'                    # rollback over the online connection (net_relay); needs online play on
     if a.mac and not (env.get('VK_DRIVER_FILES') or env.get('VK_ICD_FILENAMES')):
         # MoltenVK (the Vulkan driver on Metal) named for Homebrew's Vulkan loader, as play_mac.sh does: run.py started by hand
         icd = next((p for p in ('/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json', '/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json',
@@ -189,12 +231,25 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition('=')
         env[k] = v
+    env = {k: v for k, v in env.items() if k.upper() != 'SSBU_NICKNAME'}
+    env['SSBU_NICKNAME'] = player
+    try:
+        mode = configure_network(exe, env, auto_rollback=a.play and a.exe == main_exe and not (a.linux or a.mac))
+    except ValueError as error:
+        ap.error(str(error))
+    print('Connection: %s' % mode)
+    if mode == 'upstream' and env.get('SSBU_RB_NET') == 'net':
+        print('Rollback netcode on (upstream connection)')
     os.makedirs(a.userdata, exist_ok=True)
     os.makedirs(os.path.join(a.build, 'cache'), exist_ok=True)      # the runtime creates ..\cache\vk below it but not the folder itself (found 2026-10-13: with SSBU_VK_PREP=0 on a clean build nothing was saved)
     cmd = [exe, os.path.join(a.build, 'binaries', state.get('game_version', '13.0.4'), 'main.elf'), str(a.seconds)]
     t0 = time.time()
     out = open(a.log, 'wb') if a.log else None
-    p = subprocess.run(cmd, cwd=work, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    try:
+        p = subprocess.run(cmd, cwd=work, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    finally:
+        if out:
+            out.close()
     print('game exited with code %d after %.0f s' % (p.returncode, time.time() - t0))
     return p.returncode
 

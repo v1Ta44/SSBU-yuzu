@@ -49,6 +49,10 @@ extern char **environ;
 #endif
 #include "imgui.h"
 #include "net_stats.h"
+#include "network_protocol.h"
+#if SSBU_ENABLE_YUZU
+extern "C" int console_bridge_request_restart(void);
+#endif
 extern "C" uint32_t net_match_host(void);      /* net_relay.c / net_off.c: the matched host (the F1 table marks its room) */
 extern "C" {
 #include "gfx_options.h"
@@ -831,8 +835,8 @@ static void sec_controls(void) {
  * only when online play is on), so every control here is [restart]; "Restart the game now" starts this exe again with the
  * same command line and ends this copy (net_start of the new copy waits for the old one to be gone). */
 #define ONLINE_DEFAULT_LOBBY "opensmash-lobby.duckdns.org:39500"      /* the project's public lobby server (host:port); a domain name can replace it */
-static const char *const k_online_mode[] = {"off", "lan", "host", "join", "lobby"};
-static const char *const k_online_name[] = {"Off", "Same network (LAN)", "Host a room (room code)", "Join with a code", "Lobby server (recommended)"};
+static const char *const k_online_mode[] = {"off", "lan", "host", "join", "lobby", "yuzu"};
+static const char *const k_online_name[] = {"Off", "Same network (LAN)", "Host a room (room code)", "Join with a code", "Lobby server", "Yuzu room"};
 static struct { int mode, last_mode; bool upnp, relay_only; char join[64], server[128]; } O, O0;
 static void sec_online(void);
 static int g_online_inited;
@@ -865,16 +869,20 @@ static int ini_read(const char *key, char *out, int n) {       /* "key = value" 
 static int off_word(const char *v) { return !*v || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"); }
 static void online_init(void) {
     char v[128];
+    bool initialized = g_online_inited != 0;
+    auto original = O0;
     memset(&O, 0, sizeof O);
     O.upnp = 1;
     if (ini_read("online_mode", v, sizeof v)) {
         if (off_word(v)) O.mode = 0;
+        else if (!_stricmp(v, "yuzu")) O.mode = SSBU_ENABLE_YUZU ? 5 : 0;
         else if (!_stricmp(v, "lan")) O.mode = 1;
         else if (!_strnicmp(v, "host", 4)) O.mode = 2;
         else if (!_strnicmp(v, "join", 4)) { O.mode = 3; if (v[4] == ':') snprintf(O.join, sizeof O.join, "%s", v + 5); }
         else if (!_stricmp(v, "1") || !_stricmp(v, "on") || !_stricmp(v, "auto")) O.mode = ini_read("online_server", v, sizeof v) && !off_word(v) ? 4 : 1;
         else O.mode = 4;
-    } else if (!ini_read("online_server", v, sizeof v) || !off_word(v)) O.mode = 4;   /* nothing in the file: ON with the public lobby (2026-10-20) */
+    } else if (!ini_read("online_server", v, sizeof v)) O.mode = SSBU_ENABLE_YUZU ? 5 : 4;
+    else if (!off_word(v)) O.mode = 4;   /* nothing in the file: ON with the public lobby (2026-10-20) */
     if (!O.join[0]) ini_read("online_join", O.join, sizeof O.join);
     if (!ini_read("online_server", O.server, sizeof O.server) || off_word(O.server)) snprintf(O.server, sizeof O.server, "%s", ONLINE_DEFAULT_LOBBY);
     if (ini_read("online_upnp", v, sizeof v)) O.upnp = !off_word(v);
@@ -882,7 +890,8 @@ static void online_init(void) {
     /* what this run started with: the online code's own answer (SSBU_ONLINE wins over the file) */
     O.last_mode = O.mode;
     O0 = O;
-    O0.mode = !net_online() ? 0 : net_mode() == NET_MODE_LAN ? 1 : net_mode() == NET_MODE_HOST ? 2 : net_mode() == NET_MODE_JOIN ? 3 : 4;
+    O0.mode = network_protocol() == SSBU_PROTOCOL_YUZU ? 5 : !net_online() ? 0 : net_mode() == NET_MODE_LAN ? 1 : net_mode() == NET_MODE_HOST ? 2 : net_mode() == NET_MODE_JOIN ? 3 : 4;
+    if (initialized) O0 = original;
     g_online_inited = 1;
 }
 static void online_save(void) {
@@ -918,6 +927,13 @@ static DWORD WINAPI osk_name_thread(LPVOID arg) {          /* the on-screen keyb
 }
 static DWORD WINAPI restart_thread(LPVOID) { Sleep(100); exit(0); return 0; }      /* the exit handlers (UPnP, lobby) run */
 static void restart_game(void) {
+#if SSBU_ENABLE_YUZU
+    if (getenv("SSBU_CONSOLE_PIPE")) {
+        if (console_bridge_request_restart()) printf("menu: restart requested through Console\n");
+        else menu_popup("Restart", "Console is disconnected. Close the game and start it again in Console.");
+        return;
+    }
+#endif
     wchar_t dir[MAX_PATH], pid[16];
     GetCurrentDirectoryW(MAX_PATH, dir);
     swprintf(pid, 16, L"%lu", GetCurrentProcessId());
@@ -1081,13 +1097,14 @@ static void sec_experimental(void) {
 #endif
             rb_on = ini_read("rollback", v, sizeof v) && !off_word(v); rb_on0 = rb_on;
         }
-        if (onoff("rb", rb_on != 0, rb_have || rb_on)) { rb_on = !rb_on; ini("rollback", rb_on ? "on" : "off"); }
+        if (onoff("rb", rb_on != 0 && O.mode != 5, O.mode != 5 && (rb_have || rb_on))) { rb_on = !rb_on; ini("rollback", rb_on ? "on" : "off"); }
         ImGui::SameLine(); ImGui::Text("Rollback netcode");
         tag(1, rb_on != rb_on0);
         ImGui::SameLine();
-        if (rb_have) ImGui::TextDisabled("smooth online fights at high ping (experimental); both players need it on");
+        if (O.mode == 5) ImGui::TextDisabled("Yuzu rooms use the game's own netcode; rollback is unavailable.");
+        else if (rb_have) ImGui::TextDisabled("smooth online fights at high ping (experimental); both players need it on");
         else ImGui::TextDisabled("not in the Linux / macOS build yet");
-        if (getenv("SSBU_RB_NET")) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "Rollback is active in this run (SSBU_RB_NET=%s).", getenv("SSBU_RB_NET"));
+        if (O0.mode != 5 && O0.mode != 0 && getenv("SSBU_RB_NET")) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "Rollback is active in this run (SSBU_RB_NET=%s).", getenv("SSBU_RB_NET"));
         sec_online();
     }
     if (online_differs() || S.runahead != S0.runahead || strcmp(pname, pname0)) {
@@ -1111,9 +1128,11 @@ static void sec_online(void) {
     ImGui::SetWindowFontScale(1.2f);
     int changed = 0;
     static const int order[4] = {4, 1, 2, 3};      /* the lobby first: it needs nothing from the router */
+    if (SSBU_ENABLE_YUZU && ImGui::RadioButton(k_online_name[5], O.mode == 5)) { O.mode = O.last_mode = 5; changed = 1; }
     for (int k = 0; k < 4; k++) { int i = order[k]; if (ImGui::RadioButton(k_online_name[i], O.mode == i)) { O.mode = O.last_mode = i; changed = 1; } }
     ImGui::SetWindowFontScale(1.0f);
     tag(1, O.mode != O0.mode);
+    if (O.mode == 5) help("Use Console to join a Yuzu server room, then open Local Wireless in the game. Changes take effect after restart.");
     if (O.mode == 1) help("Every player on the same home network chooses Same network. One game hosts the room list by itself; nothing to type.");
     if (O.mode == 2) {
         const char *code = O0.mode == 2 ? net_room_code() : "";
@@ -1591,6 +1610,7 @@ static void set_open(int on) {
     if (on == (g_open != 0)) return;
     if (on) {
         InterlockedExchange(&g_open, 1);
+        online_init(); /* Re-read settings changed in Console; preserve this process's original selection. */
         InterlockedExchange(&g_guard, 1);
         g_section_req = g_section;
         capture_cancel("menu opened");

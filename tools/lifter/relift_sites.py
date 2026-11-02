@@ -913,7 +913,14 @@ def main():
         cmd_head, cmd_tail = [comp.clang, '-shared'], []
     else:
         shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
-        cmd_head, cmd_tail = [comp.clang, '-shared', '-O1', '-w', '-I', HERE, '-I', gen, shim, os.path.join(gen, 'sky_sites.c')], []
+        # The current host imports game_data_bind too: include the same dump-derived
+        # tables and lifted SDK objects as build.py, rather than linking the old shim-only DLL.
+        import build as host_build
+        data_objs = host_build.compile_game_data(obj + '_data', shim)
+        if data_objs is None:
+            return 1
+        objs += data_objs
+        cmd_head, cmd_tail = [comp.clang, '-shared', '-O1', '-w', '-I', HERE, '-I', gen, os.path.join(gen, 'sky_sites.c')], []
     rsp = dll + '.rsp'
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))

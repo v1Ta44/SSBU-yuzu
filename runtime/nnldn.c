@@ -35,6 +35,8 @@
 #include <string.h>
 #include "hostrt.h"
 #include "net_relay.h"
+#include "network_protocol.h"
+#include "network_abi.h"
 
 void os_init_event(uint64_t key, int autoclear);          /* os_threads.c */
 void os_signal_event(uint64_t key);
@@ -480,7 +482,13 @@ static void ldn_Disconnect(Ctx *c) {
     RET(0);
 }
 static int in_network(void) { return L.state == LS_AP_CREATED || L.state == LS_STA_CONNECTED; }
-int nnldn_players(void) {                 /* players in this player's room, itself included; 0 = not in a room. No lock: one byte */
+/* Players in the game's room, including this PC; zero while outside a room. */
+int nnldn_players(void) {
+    if (network_protocol() == SSBU_PROTOCOL_YUZU) {
+        int role, players;
+        network_protocol_ldn(&role, &players);
+        return players;
+    }
     int s = L.state;
     return s == LS_AP_CREATED || s == LS_STA_CONNECTED ? L.net[NI_NODE_COUNT] : 0;
 }
@@ -493,7 +501,16 @@ uint32_t nnldn_other_ip(void) {
     ReleaseSRWLockShared(&L.lock);
     return n == 1 ? r : 0;
 }
-int nnldn_role(void) { int s = L.state; return s == LS_AP_CREATED ? 1 : s == LS_STA_CONNECTED ? 2 : 0; }      /* (R3 pub1) 1 = this game made the room, 2 = it joined one, 0 = no room */
+/* 1 = room maker, 2 = joined, 0 = outside a room. */
+int nnldn_role(void) {
+    if (network_protocol() == SSBU_PROTOCOL_YUZU) {
+        int role, players;
+        network_protocol_ldn(&role, &players);
+        return role;
+    }
+    int s = L.state;
+    return s == LS_AP_CREATED ? 1 : s == LS_STA_CONNECTED ? 2 : 0;
+}
 int nnldn_has_node(uint32_t ip) {
     AcquireSRWLockShared(&L.lock);
     int in = in_network() && node_index(ip) >= 0;
@@ -915,45 +932,61 @@ static void so_accept(Ctx *c) {           /* no stream ever connects on the virt
 #define SOK(n) "_ZN2nn6socket" n
 #define LDNK(n) "_ZN2nn3ldn" n
 void nnldn_register(void) {
-    if (!net_online()) return;
-    static const ImportDef defs[] = {
-        {LDNK("10InitializeEv"), ldn_Initialize}, {LDNK("8FinalizeEv"), ldn_Finalize}, {LDNK("8GetStateEv"), ldn_GetState},
-        {LDNK("22AttachStateChangeEventEPNS_2os15SystemEventTypeE"), ldn_AttachStateChangeEvent},
-        {LDNK("32SetWirelessControllerRestrictionENS0_29WirelessControllerRestrictionE"), ldn_SetWirelessControllerRestriction},
-        {LDNK("11OpenStationEv"), ldn_OpenStation}, {LDNK("12CloseStationEv"), ldn_CloseStation},
-        {LDNK("15OpenAccessPointEv"), ldn_OpenAccessPoint}, {LDNK("16CloseAccessPointEv"), ldn_CloseAccessPoint},
-        {LDNK("10DisconnectEv"), ldn_Disconnect}, {LDNK("14DestroyNetworkEv"), ldn_DestroyNetwork},
-        {LDNK("14GetNetworkInfoEPNS0_11NetworkInfoE"), ldn_GetNetworkInfo}, {LDNK("16GetNetworkConfigEPNS0_13NetworkConfigE"), ldn_GetNetworkConfig},
-        {LDNK("14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE"), ldn_GetIpv4Address},
-        {LDNK("20GetSecurityParameterEPNS0_17SecurityParameterE"), ldn_GetSecurityParameter},
-        {LDNK("16SetAdvertiseDataEPKvm"), ldn_SetAdvertiseData}, {LDNK("22SetStationAcceptPolicyENS0_12AcceptPolicyE"), ldn_SetStationAcceptPolicy},
-        {LDNK("6RejectENS0_11Ipv4AddressE"), ldn_Reject},
-        {LDNK("4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_Scan},
-        {LDNK("11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_Scan},
-        {LDNK("13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE"), ldn_CreateNetwork},
-        {LDNK("20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE"), ldn_CreateNetworkPrivate},
-        {LDNK("7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_Connect},
-        {LDNK("14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_ConnectPrivate},
-        {LDNK("19GetDisconnectReasonEv"), ldn_GetDisconnectReason},
-        {SOK("6SocketEiii"), so_socket}, {SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), so_socket}, {"nnsocketSocket", so_socket},
-        {SOK("5CloseEi"), so_close}, {"nnsocketClose", so_close},
-        {SOK("4BindEiPK8sockaddrj"), so_bind}, {SOK("4BindEiPKNS0_8SockAddrEj"), so_bind}, {"nnsocketBind", so_bind},
-        {SOK("7ConnectEiPK8sockaddrj"), so_connect}, {"nnsocketConnect", so_connect},
-        {SOK("6ListenEii"), so_listen}, {SOK("8ShutdownEii"), so_shutdown}, {SOK("6AcceptEiP8sockaddrPj"), so_accept},
-        {SOK("11GetSockNameEiP8sockaddrPj"), so_getsockname}, {"nnsocketGetSockName", so_getsockname}, {"nnsocketGetPeerName", so_getpeername},
-        {SOK("4RecvEiPvmi"), so_recv}, {"nnsocketRecv", so_recv},
-        {SOK("8RecvFromEiPvmiP8sockaddrPj"), so_recvfrom}, {SOK("8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj"), so_recvfrom},
-        {SOK("4SendEiPKvmi"), so_send}, {"nnsocketSend", so_send},
-        {SOK("6SendToEiPKvmiPK8sockaddrj"), so_sendto}, {SOK("6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj"), so_sendto},
-        {SOK("5FcntlEiiz"), so_fcntl}, {"nnsocketFcntl", so_fcntl},
-        {SOK("4PollEP6pollfdmi"), so_poll}, {"nnsocketPoll", so_poll},
-        {SOK("10GetSockOptEiiiPvPj"), so_getsockopt}, {"nnsocketGetSockOpt", so_getsockopt},
-        {SOK("10SetSockOptEiiiPKvj"), so_setsockopt}, {SOK("10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj"), so_setsockopt}, {"nnsocketSetSockOpt", so_setsockopt},
+    if (network_protocol() == SSBU_PROTOCOL_OFF) return;
+    if (network_protocol() == SSBU_PROTOCOL_UPSTREAM && !net_online()) return;
+    static const NetworkBinding defs[] = {
+        {LDNK("10InitializeEv"), ldn_Initialize, NET_ABI_LDN_INIT}, {LDNK("8FinalizeEv"), ldn_Finalize, NET_ABI_LDN_FINAL}, {LDNK("8GetStateEv"), ldn_GetState, NET_ABI_LDN_STATE},
+        {LDNK("22AttachStateChangeEventEPNS_2os15SystemEventTypeE"), ldn_AttachStateChangeEvent, NET_ABI_LDN_EVENT},
+        {LDNK("32SetWirelessControllerRestrictionENS0_29WirelessControllerRestrictionE"), ldn_SetWirelessControllerRestriction, NET_ABI_LDN_CONTROLLER},
+        {LDNK("11OpenStationEv"), ldn_OpenStation, NET_ABI_LDN_OPEN_STA}, {LDNK("12CloseStationEv"), ldn_CloseStation, NET_ABI_LDN_CLOSE_STA},
+        {LDNK("15OpenAccessPointEv"), ldn_OpenAccessPoint, NET_ABI_LDN_OPEN_AP}, {LDNK("16CloseAccessPointEv"), ldn_CloseAccessPoint, NET_ABI_LDN_CLOSE_AP},
+        {LDNK("10DisconnectEv"), ldn_Disconnect, NET_ABI_LDN_DISCONNECT}, {LDNK("14DestroyNetworkEv"), ldn_DestroyNetwork, NET_ABI_LDN_DESTROY},
+        {LDNK("14GetNetworkInfoEPNS0_11NetworkInfoE"), ldn_GetNetworkInfo, NET_ABI_LDN_INFO}, {LDNK("16GetNetworkConfigEPNS0_13NetworkConfigE"), ldn_GetNetworkConfig, NET_ABI_LDN_CONFIG},
+        {LDNK("14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE"), ldn_GetIpv4Address, NET_ABI_LDN_IP},
+        {LDNK("20GetSecurityParameterEPNS0_17SecurityParameterE"), ldn_GetSecurityParameter, NET_ABI_LDN_SECURITY},
+        {LDNK("16SetAdvertiseDataEPKvm"), ldn_SetAdvertiseData, NET_ABI_LDN_ADVERTISE}, {LDNK("22SetStationAcceptPolicyENS0_12AcceptPolicyE"), ldn_SetStationAcceptPolicy, NET_ABI_LDN_POLICY},
+        {LDNK("6RejectENS0_11Ipv4AddressE"), ldn_Reject, NET_ABI_LDN_REJECT},
+        {LDNK("4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_Scan, NET_ABI_LDN_SCAN},
+        {LDNK("11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_Scan, NET_ABI_LDN_SCAN},
+        {LDNK("13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE"), ldn_CreateNetwork, NET_ABI_LDN_CREATE},
+        {LDNK("20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE"), ldn_CreateNetworkPrivate, NET_ABI_LDN_CREATE_PRIVATE},
+        {LDNK("7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_Connect, NET_ABI_LDN_CONNECT},
+        {LDNK("14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_ConnectPrivate, NET_ABI_LDN_CONNECT_PRIVATE},
+        {LDNK("19GetDisconnectReasonEv"), ldn_GetDisconnectReason, NET_ABI_LDN_REASON},
+        {SOK("6SocketEiii"), so_socket, NET_ABI_SOCKET_SOCKET}, {SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), so_socket, NET_ABI_SOCKET_SOCKET}, {"nnsocketSocket", so_socket, NET_ABI_SOCKET_SOCKET},
+        {SOK("5CloseEi"), so_close, NET_ABI_SOCKET_CLOSE}, {"nnsocketClose", so_close, NET_ABI_SOCKET_CLOSE},
+        {SOK("4BindEiPK8sockaddrj"), so_bind, NET_ABI_SOCKET_BIND}, {SOK("4BindEiPKNS0_8SockAddrEj"), so_bind, NET_ABI_SOCKET_BIND_TYPED}, {"nnsocketBind", so_bind, NET_ABI_SOCKET_BIND},
+        {SOK("7ConnectEiPK8sockaddrj"), so_connect, NET_ABI_SOCKET_CONNECT}, {"nnsocketConnect", so_connect, NET_ABI_SOCKET_CONNECT},
+        {SOK("6ListenEii"), so_listen, NET_ABI_SOCKET_LISTEN}, {SOK("8ShutdownEii"), so_shutdown, NET_ABI_SOCKET_SHUTDOWN}, {SOK("6AcceptEiP8sockaddrPj"), so_accept, NET_ABI_SOCKET_ACCEPT},
+        {SOK("11GetSockNameEiP8sockaddrPj"), so_getsockname, NET_ABI_SOCKET_SOCKNAME}, {"nnsocketGetSockName", so_getsockname, NET_ABI_SOCKET_SOCKNAME}, {"nnsocketGetPeerName", so_getpeername, NET_ABI_SOCKET_PEERNAME},
+        {SOK("4RecvEiPvmi"), so_recv, NET_ABI_SOCKET_RECV}, {"nnsocketRecv", so_recv, NET_ABI_SOCKET_RECV},
+        {SOK("8RecvFromEiPvmiP8sockaddrPj"), so_recvfrom, NET_ABI_SOCKET_RECVFROM}, {SOK("8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj"), so_recvfrom, NET_ABI_SOCKET_RECVFROM},
+        {SOK("4SendEiPKvmi"), so_send, NET_ABI_SOCKET_SEND}, {"nnsocketSend", so_send, NET_ABI_SOCKET_SEND},
+        {SOK("6SendToEiPKvmiPK8sockaddrj"), so_sendto, NET_ABI_SOCKET_SENDTO}, {SOK("6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj"), so_sendto, NET_ABI_SOCKET_SENDTO},
+        {SOK("5FcntlEiiz"), so_fcntl, NET_ABI_SOCKET_FCNTL}, {"nnsocketFcntl", so_fcntl, NET_ABI_SOCKET_FCNTL},
+        {SOK("4PollEP6pollfdmi"), so_poll, NET_ABI_SOCKET_POLL}, {"nnsocketPoll", so_poll, NET_ABI_SOCKET_POLL},
+        {SOK("10GetSockOptEiiiPvPj"), so_getsockopt, NET_ABI_SOCKET_GETOPT}, {"nnsocketGetSockOpt", so_getsockopt, NET_ABI_SOCKET_GETOPT},
+        {SOK("10SetSockOptEiiiPKvj"), so_setsockopt, NET_ABI_SOCKET_SETOPT}, {SOK("10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj"), so_setsockopt, NET_ABI_SOCKET_SETOPT}, {"nnsocketSetSockOpt", so_setsockopt, NET_ABI_SOCKET_SETOPT},
+        {SOK("8FinalizeEv"), NULL, NET_ABI_SOCKET_FINALIZE},
     };
-    int n = (int)(sizeof defs / sizeof defs[0]), missing = 0;
-    for (int i = 0; i < n; i++) if (!import_data(defs[i].name)) { printf("[online] \"%s\" is not an import of the game\n", defs[i].name); missing++; }
-    register_imports(defs, n);
+    ImportDef bindings[sizeof defs / sizeof defs[0]];
+    int n = 0, missing = 0;
+    for (unsigned i = 0; i < sizeof defs / sizeof defs[0]; i++) {
+        ImportFn handler = defs[i].fn;
+#if SSBU_ENABLE_YUZU
+        if (network_protocol() == SSBU_PROTOCOL_YUZU) handler = yuzu_protocol_handler(defs[i].operation);
+#endif
+        /* Finalize uses the ordinary SDK handler on the upstream path. */
+        if (!handler) continue;
+        bindings[n].name = defs[i].name;
+        bindings[n++].fn = handler;
+        if (!import_data(defs[i].name)) {
+            printf("[online] \"%s\" is not an import of the game\n", defs[i].name);
+            missing++;
+        }
+    }
+    register_imports(bindings, n);
     printf("[online] nn::ldn and nn::socket replaced by the virtual network (%d handlers, %d not imported)\n", n, missing);
     fflush(stdout);
-    net_start();                          /* join the lobby during boot: the address is there when Local Wireless opens */
+    if (network_protocol() == SSBU_PROTOCOL_UPSTREAM) net_start();
 }

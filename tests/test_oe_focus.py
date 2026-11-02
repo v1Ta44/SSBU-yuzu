@@ -1,6 +1,8 @@
 """Exercise focus notifications while the guest waits instead of polling, using real runtime events.
-Requires an existing game build (scripts/setup.py --dump <dump> --only link). No game session or GPU is started.
+Use --isolated for real events/watcher tests with game/renderer boundaries stubbed.
+The original full-host path requires an existing game build. Neither path starts a game session or GPU.
 """
+import argparse
 import importlib.util
 import json
 import os
@@ -11,7 +13,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def main():
+def existing_host_main():
     state = json.loads((ROOT / 'build/state.json').read_text())
     work = ROOT / 'build/work'
     os.environ.update(RECOMP_CLANG=state['tools']['clang'], SDL3_ROOT=state['tools']['sdl3'],
@@ -48,7 +50,39 @@ def main():
     subprocess.run([str(exe)], cwd=work, check=True, timeout=20)
     subprocess.run([str(exe), '--guest-bootstrap'], cwd=work, check=True, timeout=20)
     subprocess.run([str(exe), '--disabled'], cwd=work, check=True, timeout=20)
+    subprocess.run([str(exe), '--default'], cwd=work, check=True, timeout=20)
     return 0
+
+
+def isolated_main(clang):
+    out = ROOT / 'build/focus-input-20261025'
+    out.mkdir(parents=True, exist_ok=True)
+    exe = out / 'oe_focus_test.exe'
+    command = [clang, '-O1', '-w', '-I', str(ROOT / 'runtime'),
+               str(ROOT / 'tests/oe_focus_standalone.c'), '-ladvapi32', '-luser32', '-o', str(exe)]
+    build = subprocess.run(command, capture_output=True, timeout=120)
+    (out / 'focus-build.log').write_bytes(build.stdout + build.stderr)
+    build.check_returncode()
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(('SSBU_', 'RECOMP_'))}
+    results = []
+    for case in ['', '--guest-bootstrap', '--disabled', '--default', '--exit-nested', '--exit-suspended', '--exit-background']:
+        run = subprocess.run([str(exe)] + ([case] if case else []), cwd=out, env=env, capture_output=True, timeout=20)
+        (out / ('focus' + case + '.log')).write_bytes(run.stdout + run.stderr)
+        run.check_returncode()
+        text = run.stdout.decode('utf-8', 'replace')
+        assert 'PASS ' in text, (case, text)
+        results.append({'case': case or 'explicit-upstream', 'passed': True, 'checks': text.count('PASS ')})
+        print('PASS isolated focus/exit', case or 'explicit-upstream')
+    (out / 'focus-results.json').write_text(json.dumps(results, indent=2) + '\n', encoding='utf-8')
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--isolated', action='store_true', help='use real nn::oe/nn::os with no game build')
+    parser.add_argument('--clang', default=os.environ.get('RECOMP_CLANG') or str(ROOT / 'deps/llvm/bin/clang.exe'))
+    args = parser.parse_args()
+    return isolated_main(args.clang) if args.isolated else existing_host_main()
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@
 #include <dbghelp.h>                                /* minidump types; dbghelp.dll itself is loaded only when a dump is written */
 #include "runtime.h"
 #include "hostrt.h"
+#include "network_protocol.h"
 
 #define FILE_OFF 0x1000ULL
 #define IMAGE_SIZE 0x7500000ULL          /* the whole image with bss: 13.0.4 and 13.0.5 both end below it */
@@ -699,6 +700,9 @@ void (*g_exit_report_hook)(FILE *);          /* a test's own last line (nnsdk2.c
 void (*g_plugin_report_hook)(void);          /* skyline.c: how often the plugins' hooks ran */
 
 void report_and_exit(int code) {
+#if SSBU_ENABLE_YUZU
+    { void ssbu_net_leave(void); ssbu_net_leave(); }
+#endif
     if (g_exit_report_hook) g_exit_report_hook(stdout);
     if (g_plugin_report_hook) g_plugin_report_hook();
     audit_exit_counts();

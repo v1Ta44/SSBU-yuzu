@@ -44,6 +44,20 @@ static HMONITOR test_MonitorFromWindow(HWND w, DWORD flags) {
 #undef MonitorFromWindow
 
 static uint64_t notification_event;
+static uint8_t game_frame_gate[0x28];
+/* The real game's notification handler at 0x71037549e0 signals its
+ * main-loop gate for InFocus (1), clears it for OutOfFocus (2), and leaves
+ * it alone for Background (3). The main loop waits at 0x7103747bf0. */
+static void require_game_can_run(int expected) {
+    Ctx focus = {0}, event = {0};
+    oe_GetCurrentFocusState(&focus);
+    event.x[0] = (uint64_t)(uintptr_t)game_frame_gate;
+    if (focus.x[0] == 1) ev_signal(&event);
+    else if (focus.x[0] == 2) ev_clear(&event);
+    int runnable = ev_wait_ms(obj(event.x[0]), 0);
+    if (runnable != expected) fprintf(stderr, "FAIL real-game focus gate: reported focus %llu, runnable %d, expected %d\n", (unsigned long long)focus.x[0], runnable, expected);
+    assert(runnable == expected);
+}
 static void mode(int value) {
     Ctx c = {0}; c.x[0] = value; oe_SetFocusHandlingMode(&c);
 }
@@ -89,10 +103,25 @@ static int ignored_startup(const char *name) {
     if (!ok) fprintf(stderr, "FAIL %s startup incorrectly armed focus tracking\n", name);
     return ok;
 }
+
+/* Match both side effects of the game's message-15 handler: state 2 closes
+ * its frame gate; state 3 dispatches message 4 and pauses/resyncs movies. */
+static int require_background_transition(int foreground,int minimised,int physical) {
+    change_focus(foreground,minimised);Sleep(120);
+    Ctx c={0};oe_GetCurrentFocusState(&c);
+    EnterCriticalSection(&g_oe_lock);
+    int raw=g_oe_focus_state, queued=g_oe_count;
+    LeaveCriticalSection(&g_oe_lock);
+    if(raw!=physical || c.x[0]!=1 || queued || g_guest_frozen){
+        fprintf(stderr,"FAIL background gameplay: physical=%d expected=%d game_focus=%llu queued=%d frozen=%ld; state 3 broadcasts background/pause message 4 to scene subscribers\n",raw,physical,(unsigned long long)c.x[0],queued,g_guest_frozen);return 0;
+    }
+    require_game_can_run(1);return 1;
+}
 int main(int argc, char **argv) {
+    int default_mode = argc > 1 && !strcmp(argv[1], "--default");
     int disabled = argc > 1 && !strcmp(argv[1], "--disabled");
     _putenv("SSBU_FREEZE_TEST=");
-    _putenv(disabled ? "SSBU_FOCUS_NOTIFY=0" : "SSBU_FOCUS_NOTIFY=1");
+    _putenv(default_mode ? "SSBU_FOCUS_NOTIFY=" : disabled ? "SSBU_FOCUS_NOTIFY=0" : "SSBU_FOCUS_NOTIFY=1");
     InitializeCriticalSection(&g_oe_lock);
     Ctx c = {0};
     /* Asking for the event must also start the watcher; no other oe call here. */
@@ -116,6 +145,8 @@ int main(int argc, char **argv) {
     InterlockedExchange(&test_minimised, 1);
     if (!ignored_startup("minimized")) return 1;
     puts("PASS transient off-screen, non-activating, hidden and minimized startup never arms focus tracking");
+    os_init_event((uint64_t)(uintptr_t)game_frame_gate, 0);
+    os_signal_event((uint64_t)(uintptr_t)game_frame_gate);
     change_focus(1, 0);
     ULONGLONG deadline = GetTickCount64() + 2000;
     int seen = 0;
@@ -123,6 +154,20 @@ int main(int argc, char **argv) {
         EnterCriticalSection(&g_oe_lock); seen = g_oe_was_foreground; LeaveCriticalSection(&g_oe_lock); Sleep(5);
     }
     if (!seen) { puts("FAIL event-only subscriber never starts focus observation"); return 1; }
+    if (default_mode) {
+        assert(g_oe_background_run);
+        for (int requested = 0; requested < 4; requested++) {
+            mode(requested); drain();
+            assert(g_oe_focus_mode == requested && oe_effective_focus_mode() == 1);
+            if(!require_background_transition(0,0,2))return 1;
+            if(!require_background_transition(1,0,1))return 1;
+            if(!require_background_transition(0,1,3))return 1;
+            if(!require_background_transition(1,0,1))return 1;
+        }
+        puts("PASS default background policy: all four requested modes keep the real game main-loop gate open, with physical focus tracking, no scene or movie pause/resume callbacks, and no suspension");
+        return 0;
+    }
+    assert(!g_oe_background_run);
     mode(2); drain();
     for (int i = 0; i < 12; i++) {
         /* Guest observes focus loss, drains the queue, then blocks awaiting resume. */
@@ -134,7 +179,8 @@ int main(int argc, char **argv) {
     Sleep(100); assert(!ev_wait_ms(obj(notification_event), 0));
     puts("PASS steady focus does not repost notifications; draining clears the event");
     mode(1); drain();
-    require_transition(0, 0, 2); require_transition(1, 0, 1);
+    require_transition(0, 0, 2); require_game_can_run(0);
+    require_transition(1, 0, 1); require_game_can_run(1);
     require_transition(0, 1, 3); wait_frozen(0); require_transition(1, 0, 1);
     puts("PASS NoSuspend: obscured and minimised notifications, no suspension");
     mode(2); drain(); change_focus(0, 1); wait_frozen(1);

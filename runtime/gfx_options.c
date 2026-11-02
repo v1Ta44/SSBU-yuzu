@@ -244,8 +244,29 @@ const GfxOptions *gfx_options(void) {
 
 /* ---- U1, the settings menu (menu.cpp): changes while running, and the writer of graphics.ini */
 void gfx_set_overlay(int on) { gfx_options(); g_opt.overlay = on != 0; }
-/* `key = value` into the file: the first line that sets the key (not a comment) is replaced, every other line stays as it
- * is; a key that is not in the file is appended. Written to <file>.tmp, then moved over the file. */
+/* Reserve space for the next line and sprintf's terminator. A duplicate key may
+ * expand many times, so the original file size is not an output-size bound. */
+static int gfx_ini_reserve(char **out, size_t *cap, size_t used, size_t add) {
+    if (used == (size_t)-1 || add > (size_t)-1 - used - 1) return 0;
+    size_t need = used + add + 1;
+    if (need <= *cap) return 1;
+    size_t grown = *cap <= (size_t)-1 / 2 ? *cap * 2 : need;
+    if (grown < need) grown = need;
+    char *next = realloc(*out, grown);
+    if (!next) return 0;
+    *out = next; *cap = grown;
+    return 1;
+}
+static int gfx_ini_key_line(const char *line, size_t len, const char *key, size_t kl) {
+    while (len && (*line == ' ' || *line == '\t')) { line++; len--; }
+    if (len < kl || _strnicmp(line, key, kl)) return 0;
+    line += kl; len -= kl;
+    while (len && (*line == ' ' || *line == '\t')) { line++; len--; }
+    return len && *line == '=';
+}
+/* Replace every line setting this key, as Console does: first- and last-match
+ * readers then agree after restart. Unrelated lines keep their original bytes;
+ * a missing key is appended. Write to <file>.tmp, then move over the file. */
 int gfx_ini_set(const char *key, const char *value) {
     const GfxOptions *o = gfx_options();
     static CRITICAL_SECTION cs;
@@ -253,31 +274,48 @@ int gfx_ini_set(const char *key, const char *value) {
     if (InterlockedCompareExchange(&cs_ready, 1, 0) == 0) { InitializeCriticalSection(&cs); cs_ready = 2; }
     while (cs_ready != 2) Sleep(0);
     EnterCriticalSection(&cs);
-    FILE *f = fopen(o->path, "rb");
-    char *old = NULL;
-    long n = 0;
-    if (f) { fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET); old = malloc((size_t)n + 1); if (old) { n = (long)fread(old, 1, (size_t)n, f); old[n] = 0; } fclose(f); }
-    size_t cap = (size_t)n + strlen(key) + strlen(value) + 64, o2 = 0, kl = strlen(key);
-    char *out = malloc(cap), tmp[MAX_PATH + 8];
+    char *old = NULL, *out = NULL, tmp[MAX_PATH + 8];
+    size_t cap = 0, o2 = 0, kl = strlen(key), vl = strlen(value);
     int done = 0, ok = 0;
-    if (!out) { free(old); LeaveCriticalSection(&cs); return 0; }
+    FILE *f = fopen(o->path, "rb");
+    if (f) {
+        long n;
+        if (fseek(f, 0, SEEK_END) || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET)) { fclose(f); goto finish; }
+        old = malloc((size_t)n + 1);
+        if (!old) { fclose(f); goto finish; }
+        size_t read = fread(old, 1, (size_t)n, f);
+        int failed = ferror(f);
+        fclose(f);
+        if (failed) goto finish;
+        old[read] = 0;
+    }
+    if (kl > (size_t)-1 - 5 || vl > (size_t)-1 - kl - 5) goto finish;
+    size_t replacement = kl + vl + 5;       /* key + " = " + value + CRLF */
     for (char *p = old; p && *p; ) {
         char *e = strchr(p, '\n');
         size_t l = e ? (size_t)(e - p) + 1 : strlen(p);
-        const char *q = p, *r;
-        while (*q == ' ' || *q == '\t') q++;
-        for (r = q + kl; *r == ' ' || *r == '\t'; r++) ;
-        if (!done && !_strnicmp(q, key, kl) && *r == '=') { o2 += (size_t)sprintf(out + o2, "%s = %s\r\n", key, value); done = 1; }
-        else { memcpy(out + o2, p, l); o2 += l; }
+        if (gfx_ini_key_line(p, l, key, kl)) {
+            if (!gfx_ini_reserve(&out, &cap, o2, replacement)) goto finish;
+            o2 += (size_t)sprintf(out + o2, "%s = %s\r\n", key, value);
+            done = 1;
+        } else {
+            if (!gfx_ini_reserve(&out, &cap, o2, l)) goto finish;
+            memcpy(out + o2, p, l); o2 += l;
+        }
         p += l;
     }
-    if (!done) { if (o2 && out[o2 - 1] != '\n') { out[o2++] = '\r'; out[o2++] = '\n'; } o2 += (size_t)sprintf(out + o2, "%s = %s\r\n", key, value); }
+    if (!done) {
+        if (replacement > (size_t)-1 - 2 || !gfx_ini_reserve(&out, &cap, o2, replacement + 2)) goto finish;
+        if (o2 && out[o2 - 1] != '\n') { out[o2++] = '\r'; out[o2++] = '\n'; }
+        o2 += (size_t)sprintf(out + o2, "%s = %s\r\n", key, value);
+    }
     snprintf(tmp, sizeof tmp, "%s.tmp", o->path);
     if ((f = fopen(tmp, "wb")) != NULL) {
         ok = fwrite(out, 1, o2, f) == o2;
         ok = !fclose(f) && ok;
         ok = ok && MoveFileExA(tmp, o->path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
+finish:
     printf("graphics options: %s = %s %s %s\n", key, value, ok ? "written to" : "could NOT be written to", o->path);
     fflush(stdout);
     free(old); free(out);

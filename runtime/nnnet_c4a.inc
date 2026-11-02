@@ -1077,8 +1077,8 @@ static void c4a_register(void) {
         {SOK("4PollEP6pollfdmi"), socket_Poll}, {"nnsocketPoll", socket_Poll},
         {SOK("10GetSockOptEiiiPvPj"), socket_GetSockOpt}, {"nnsocketGetSockOpt", socket_GetSockOpt},
         {SOK("10SetSockOptEiiiPKvj"), socket_SetSockOpt}, {SOK("10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj"), socket_SetSockOpt}, {"nnsocketSetSockOpt", socket_SetSockOpt},
-        {SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"), socket_GetAddrInfo2}, {SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"), socket_GetAddrInfoNn},
-        {SOK("12FreeAddrInfoEP8addrinfo"), socket_FreeAddrInfo2}, {SOK("12FreeAddrInfoEPNS0_8AddrInfoE"), socket_FreeAddrInfoNn},
+        {SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"), socket_GetAddrInfo2}, {"nnsocketGetAddrInfo", socket_GetAddrInfo2}, {SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"), socket_GetAddrInfoNn},
+        {SOK("12FreeAddrInfoEP8addrinfo"), socket_FreeAddrInfo2}, {"nnsocketFreeAddrInfo", socket_FreeAddrInfo2}, {SOK("12FreeAddrInfoEPNS0_8AddrInfoE"), socket_FreeAddrInfoNn},
         {SOK("11GAIStrErrorENS0_7AiErrnoE"), socket_GAIStrError2},
         {"nnsocketGetHostByNameWithOptions", socket_GetHostByNameWithOptions},
         {"nnsocketResolverGetOption", nnsocket_ResolverGetOption}, {"nnsocketResolverSetOption", nnsocket_ResolverSetOption},
@@ -1132,7 +1132,10 @@ static void c4a_register(void) {
 /* ================================================================== self-test */
 static uint64_t c4a_h1(Ctx *c, const char *name, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     c->x[0] = a0; c->x[1] = a1; c->x[2] = a2; c->x[3] = a3; c->x[4] = a4; c->x[5] = a5;
-    h(name)(c);
+    ImportFn fn = import_lookup(name);
+    if (!fn) fn = extra_import_lookup(name);              /* plugin-only SDK C aliases */
+    if (!fn) fn = h(name);
+    fn(c);
     return c->x[0];
 }
 #define H(name, ...) c4a_h6(c, name, (uint64_t[6]){__VA_ARGS__})
@@ -1255,6 +1258,15 @@ static int c4a_selftest(Ctx *c) {
     if (list) H(SOK("12FreeAddrInfoEPNS0_8AddrInfoE"), list);
     C4A_CHECK("resolver: GetAddrInfo: no arguments 8, null result 11 + EINVAL, a DNS name without network EAI_AGAIN (2) / TRY_AGAIN,\n"
               "          numeric 127.0.0.1:8080 and 10.0.0.7 converted (both result layouts)");
+    /* Skyline plugins also use the SDK C aliases, with the BSD addrinfo layout. */
+    list = 0;
+    ok = (int)H("nnsocketGetAddrInfo", P("127.0.0.1"), P("8080"), P(hints), P(&list)) == 0 && list;
+    if (list) {
+        uint64_t a = M64(list + 0x20);
+        ok = ok && M32(list + 4) == 2 && M32(list + 8) == 1 && M8(a + 2) == 0x1f && M8(a + 3) == 0x90;
+        H("nnsocketFreeAddrInfo", list);
+    }
+    C4A_CHECK("resolver: C aliases use the BSD addrinfo layout and release its allocations");
     uint64_t he = H("nnsocketGetHostByNameWithOptions", P("192.168.0.9"), 0, 0);
     ok = he && !strcmp((const char *)(uintptr_t)M64(he), "192.168.0.9") && M32(he + 0x10) == 2 && M32(he + 0x14) == 4 && M8(M64(M64(he + 0x18))) == 192 && M8(M64(M64(he + 0x18)) + 3) == 9 && M64(M64(he + 0x18) + 8) == 0;
     ok = ok && H("nnsocketGetHostByNameWithOptions", P("www.example.com"), 0, 0) == 0 && t_so_herrno == 2;

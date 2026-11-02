@@ -1,12 +1,14 @@
 """Parallel build of the lifted game.
 
     python build.py compile [jobs] [--force]    gen/*.c -> obj/*.obj (only what changed)
-    python build.py link                        obj/*.obj + host sources -> ssbu_native.exe
+    python build.py link [--with-yuzu | --without-yuzu] obj/*.obj + host sources -> ssbu_native.exe
     python build.py host                        host sources -> the exe alone (needs no game DLL; scripts/make_release.py)
     python build.py gamedll                     obj/*.obj + the game-data sources (game_data.h) -> the game DLL alone
     python build.py nro <module> [...]          lift + compile + link one DLL per run-time module (see build_nro.py)
 """
 import concurrent.futures
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -52,8 +54,19 @@ NOCRT = os.environ.get('RECOMP_NOCRT', '') not in ('', '0')
 NOCRT_DIR = os.path.join(HERE, 'nocrt')
 NOCRT_FLAGS = ['-nostdlibinc', '-isystem', NOCRT_DIR, '-DGAME_NOCRT'] if NOCRT else []
 LLD_LINK = os.path.join(os.path.dirname(CLANG), 'lld-link.exe')
+
+if not TARGET_POSIX:
+    HOST_SOURCES += ['nvn_lifetime.c']
 # A handful of files hold functions so large that clang -O1 needs more than an hour on them;
 # pass --opt=-O0 to compile whatever is still missing without optimization.
+if '--with-yuzu' in sys.argv and '--without-yuzu' in sys.argv:
+    raise SystemExit('choose --with-yuzu or --without-yuzu')
+if TARGET_POSIX and '--with-yuzu' in sys.argv:
+    raise SystemExit('Yuzu networking currently requires the Windows build')
+YUZU_NETWORK = not TARGET_POSIX and '--without-yuzu' not in sys.argv and (
+    '--with-yuzu' in sys.argv or os.environ.get('RECOMP_YUZU', '1') != '0')
+if YUZU_NETWORK:
+    HOST_SOURCES += ['network_protocol.c', 'yuzu_net.c', 'yuzu_ldn.c', 'yuzu_socket.c', 'yuzu_ui.c', 'console_bridge.c']
 OPT = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--opt=')), '-O1')
 GEN_HEADERS = ['runtime.h', 'neon.h', 'fpexact.h']
 SLOW_FILES = {'c_019e.c', 'c_00a3.c', 'c_013a.c', 'c_0099.c', 'c_0367.c', 'c_03f7.c', 'c_00b3.c', 'c_03d9.c', 'c_012f.c', 'c_00cf.c', 'c_040e.c', 'c_0180.c', 'c_04a5.c'}
@@ -177,7 +190,9 @@ HAVE_IMGUI = os.path.isfile(os.path.join(IMGUI, 'imgui.h')) and os.path.isfile(o
 CXX_SOURCES = ([os.path.join(HERE, 'menu.cpp')] + [os.path.join(IMGUI, n) for n in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp')]
                if HAVE_IMGUI else [])
 CXX_FLAGS = ['-x', 'c++', '-std=c++14', '-O1', '-g', '-w', '-fno-exceptions', '-fno-rtti', '-D_CRT_SECURE_NO_WARNINGS', '-DIMGUI_USER_CONFIG="menu_imconfig.h"', '-I', HERE, '-I', IMGUI]
-LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32', '-lsetupapi']
+HOST_FLAGS.append('-DSSBU_ENABLE_YUZU=%d' % YUZU_NETWORK)
+CXX_FLAGS.append('-DSSBU_ENABLE_YUZU=%d' % YUZU_NETWORK)
+LIBS = ['-ladvapi32', '-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32', '-lsetupapi']
 # Media Foundation delay-loaded: Windows N without the Media Feature Pack has no MFPlat.dll, and the exe must still start
 # there (the movies then play with FFmpeg, mf_ffmpeg.c); nnmovie_mf.c's movie_mf_present() is asked before any call.
 LIBS += ['-ldelayimp', '-Wl,/DELAYLOAD:MFPlat.DLL', '-Wl,/DELAYLOAD:MFReadWrite.dll']
@@ -320,24 +335,59 @@ def game_import_lib(objdir):
     return lld_def_lib(d, os.path.join(objdir, 'ssbu_game_import.lib'))
 
 
-def compile_host(job):
+def compile_host(job, host_flags=None):
     src, obj = job
-    flags = CXX_FLAGS if src.endswith('.cpp') else HOST_FLAGS
+    flags = CXX_FLAGS if src.endswith('.cpp') else (HOST_FLAGS if host_flags is None else host_flags)
     r = subprocess.run([CLANG, '-c'] + flags + [src, '-o', obj], capture_output=True, text=True)
     return src, r.returncode, (r.stdout + r.stderr)[-3000:]
 
 
 def cmd_link(host_only=False):
+    if '--with-mods' in sys.argv:
+        raise SystemExit('--with-mods was retired; use upstream Skyline / ARCropolis (docs/SKYLINE.md)')
+    if '--with-latency-slider' in sys.argv and '--without-latency-slider' in sys.argv:
+        raise SystemExit('choose --with-latency-slider or --without-latency-slider')
+    latency_slider = '--with-latency-slider' in sys.argv
+    delay_stamp = os.path.join(HERE, 'net_delay', 'build.json')
+    delay_hash = None
+    if latency_slider:
+        with open(delay_stamp, 'rb') as f:
+            data = f.read()
+            delay_hash = hashlib.sha256(data).hexdigest()
+            delay_artifacts = json.loads(data)['artifacts_sha256']
+        for relative, expected in delay_artifacts.items():
+            with open(os.path.join(HERE, relative), 'rb') as f:
+                if hashlib.sha256(f.read()).hexdigest() != expected:
+                    raise SystemExit('online delay artifact changed: ' + relative)
+    HOST_FLAGS[:] = [f for f in HOST_FLAGS if not f.startswith('-DSSBU_ENABLE_NET_DELAY=')]
+    HOST_FLAGS.append('-DSSBU_ENABLE_NET_DELAY=%d' % latency_slider)
+    HOST_FLAGS[:] = [f for f in HOST_FLAGS if not f.startswith('-DSSBU_ENABLE_RESOURCE_MODS=')]
+    host_only = host_only or '--host-only' in sys.argv
+    network_includes, network_objects = [], []
+    if YUZU_NETWORK:
+        import build_network
+        network_includes, network_objects = build_network.prepare(CLANG, HERE)
+    # Start each invocation from the base flags; repeated calls cannot accumulate include arguments.
+    host_flags = HOST_FLAGS + network_includes
     if not host_only and build_game_dll():
         return 1
     exe = os.environ.get('RECOMP_EXE', 'ssbu_native.exe')      # parallel work: one exe name per worker
     out = os.path.join(HERE, exe)
     objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)
+    flags_path = os.path.join(objdir, 'build-flags.json')
+    try:
+        with open(flags_path, encoding='utf-8') as f:
+            flags_changed = json.load(f) != [host_flags, CXX_FLAGS]
+    except (OSError, ValueError):
+        flags_changed = True
     t0 = time.time()
     newest_dep = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith(('.h', '.inc'))] + [os.path.getmtime(os.path.join(HERE, 'build.py'))])
     # nvn_vk.c includes the other nvn_vk*.c files as one translation unit: an edit of one of them must rebuild nvn_vk.obj
     newest_vk = max(os.path.getmtime(os.path.join(HERE, n)) for n in os.listdir(HERE) if n.startswith('nvn_vk') and n.endswith('.c'))
+    newest_sdk = max(os.path.getmtime(os.path.join(d, n))
+                     for d, _, names in os.walk(os.path.join(HERE, 'fighter_sdk'))
+                     for n in names if n.endswith(('.c', '.h', '.inc')))
     objs, jobs = [], []
     if not HAVE_IMGUI:
         print('settings menu: Dear ImGui not found in %s (IMGUI_ROOT): built without it (menu_stub.c; F1 does nothing)' % IMGUI)
@@ -347,19 +397,19 @@ def cmd_link(host_only=False):
     for n in HOST_SOURCES + ['gamedll.c'] + ([] if HAVE_IMGUI else ['menu_stub.c']):
         src, obj = os.path.join(HERE, 'r1src' if r1 and n == 'nncxxrt.c' else '', n), os.path.join(objdir, n[:-2] + '.obj')
         objs.append(obj)
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,
+        if flags_changed or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,
                                                                        os.path.getmtime(os.path.join(HERE, 'plat_mf.c')) if n == 'mf_ffmpeg.c' else 0,   # mf_ffmpeg.c includes plat_mf.c
-                                                                       os.path.getmtime(os.path.join(HERE, 'skyline.c')) if n == 'nnro.c' else 0):   # nnro.c includes skyline.c
+                                                                       os.path.getmtime(os.path.join(HERE, 'skyline.c')) if n == 'nnro.c' else 0, newest_sdk if n == 'nnro.c' else 0):   # nnro.c includes skyline.c
             jobs.append((src, obj))
     for src in CXX_SOURCES:                          # U1: the settings menu (C++); imgui's own files depend on their source and menu_imconfig.h only
         obj = os.path.join(objdir, os.path.splitext(os.path.basename(src))[0] + '_cxx.obj')
         objs.append(obj)
         dep = newest_dep if src.endswith('menu.cpp') else os.path.getmtime(os.path.join(HERE, 'menu_imconfig.h'))
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), dep):
+        if flags_changed or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), dep):
             jobs.append((src, obj))
     failed = 0
     with concurrent.futures.ThreadPoolExecutor(16) as pool:
-        for src, code, err in pool.map(compile_host, jobs):
+        for src, code, err in pool.map(lambda job: compile_host(job, host_flags), jobs):
             if code:
                 failed += 1
                 print('FAILED %s\n%s' % (os.path.basename(src), err))
@@ -372,7 +422,7 @@ def cmd_link(host_only=False):
         game = ['-Wl,--unresolved-symbols=ignore-in-object-files'] if host_only else ['-L', HERE, '-l:' + GAME_DLL]      # host alone: a compile + link check, not runnable
         r = subprocess.run([CLANG] + objs + game + ['-Wl,-rpath,$ORIGIN'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
     else:
-        r = subprocess.run([CLANG] + objs + [game_import_lib(objdir), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
+        r = subprocess.run([CLANG] + objs + network_objects + [game_import_lib(objdir), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
     if r.returncode == 0 and not TARGET_POSIX:
         import shutil
         try:
@@ -382,6 +432,14 @@ def cmd_link(host_only=False):
                 raise
     print((r.stdout + r.stderr)[-4000:])                 # link.exe reports its errors on stdout
     if r.returncode == 0:
+        with open(out, 'rb') as f:
+            exe_hash = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.splitext(out)[0] + '.build.json', 'w', encoding='utf-8') as f:
+            json.dump({'schema_version': 2, 'yuzu_network': YUZU_NETWORK, 'network_abi': 1, 'resource_mods': False, 'skyline_loader': True, 'latency_slider': latency_slider, 'latency_slider_sha256': delay_hash, 'exe_sha256': exe_hash}, f, indent=2)
+        with open(flags_path, 'w', encoding='utf-8') as f:
+            json.dump([host_flags, CXX_FLAGS], f)
+        print('resource loader: upstream Skyline / ARCropolis (plugin preparation required)')
+        print('online delay controls: %s' % ('enabled' if latency_slider else 'disabled'))
         print('linked %s: %.1f MB in %.1fs (%d host files recompiled)' % (out, os.path.getsize(out) / 1048576.0, time.time() - t0, len(jobs)))
     return r.returncode
 

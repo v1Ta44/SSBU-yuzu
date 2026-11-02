@@ -62,6 +62,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "net_relay.h"
+#include "network_protocol.h"
 #include "net_stats.h"
 #include "gfx_options.h"
 
@@ -278,6 +279,7 @@ static char g_join[64], g_peer[256], g_stun[128] = "stun.l.google.com:19302";
 
 static void configure(void) {
     if (g_cfg >= 0) return;
+    if (network_protocol() != SSBU_PROTOCOL_UPSTREAM) { g_cfg = 0; return; }
     char v[256] = "", mode[64] = "";
     const char *e = getenv("SSBU_ONLINE");
     g_cfg = 0;
@@ -1541,6 +1543,7 @@ void net_start(void) {
  *            otherwise the round trip to the lobby (relayed: the lobby is in between); -1 = unknown
  *   delay, rollback_*  0: the game's own Local Wireless netcode is delay based and is not ours to measure (rollback, N1). */
 void net_stats_get(NetStats *o) {
+    if (network_protocol_stats(o)) return;
     memset(o, 0, sizeof *o);
     o->ping_ms = -1;
     if (g_cfg <= 0) { o->state = NET_OFFLINE; return; }

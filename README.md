@@ -20,6 +20,19 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 
 > The project is called **OpenSmash-Ultimate**. The repository is still named `Denkishi/ssbu-recomp`.
 
+
+## Yuzu 个人整合版
+
+本分支在上游基础上提供个人使用的 Windows 便携版。`main` 保持上游原样，稳定版本放在 `yuzu`；下文的上游安装器与预编译宿主不用于更新这个便携版。已验证的游戏版本为 **13.0.4**，其余版本的个人扩展尚未验证。
+
+- **联机**：在 Console 或 F1 中选择 Yuzu 连接方式，进入游戏后使用本地无线联机；已通过真实对端联机验收。Yuzu 模式暂不接入回滚。
+- **减延迟**：保留自有减延迟和 F8 面板；全屏 / 无边框显示时面板临时置顶，F11 切换与减延迟均已由用户实机验收通过。
+- **后台运行**：失焦、最小化及房间等待时继续运行；焦点修复已通过用户验收。
+- **资源 mod**：由上游 Skyline → ARCropolis 加载，Console 负责导入和管理 `sd/ultimate/mods`。发行包配套原样 ARCropolis 与对应 PC DLL；任意新增 NRO 插件仍需要单独编译或适配。
+- **更新**：采用签名完整包覆盖目标程序，支持同版本修复；保留存档、设置和 mod。更新成功后清理下载与暂存，仅保留最近一次回退备份。
+
+完整包的空缓存启动、原样资源 mod、实际对战、旧版更新、修复、回退和自动清理结果见[完整包验证](docs/YUZU_FULL_PACKAGE_VALIDATION_2026-11-02.md)；本轮收尾与验收边界见[收尾记录](docs/YUZU_CLOSEOUT_2026-11-03.md)。
+
 > **This repository contains no game code, no game assets, no keys and no firmware.**
 > You need your own legally obtained copy of the game (13.0.4 or 13.0.5). Everything derived from it is generated on
 > your PC, from your dump, and never leaves it. The only game-related text in the tree is names: a list of

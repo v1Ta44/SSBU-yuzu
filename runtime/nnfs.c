@@ -30,6 +30,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "fs_host.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -92,37 +93,45 @@ static void fs_lock(void) {
 }
 static void fs_unlock(void) { LeaveCriticalSection(&g_fs_lock); }
 
+static char g_user_root_legacy[MAX_PATH]; /* fs_user_root ABI: host-only album code still uses ACP on Windows. */
 static void fs_roots(void) {
     if (g_rom_root[0]) return;
     const char *env = getenv("SSBU_ROMFS"), *user = getenv("SSBU_USERDATA");
     strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", MAX_PATH - 1);
     strncpy(g_user_root, user && user[0] ? user : "..\\userdata", MAX_PATH - 1);
-    CreateDirectoryA(g_user_root, NULL);
+    snprintf(g_user_root_legacy, sizeof g_user_root_legacy, "%s", g_user_root);
+#ifdef _WIN32
+    if (fsu_env(L"SSBU_ROMFS", g_rom_root, MAX_PATH) < 0 || fsu_env(L"SSBU_USERDATA", g_user_root, MAX_PATH) < 0)
+        guest_trap("nn::fs: host root cannot be represented in the path buffer", 0);
+    if (!g_rom_root[0]) strcpy(g_rom_root, "..\\romfs");
+    if (!g_user_root[0]) strcpy(g_user_root, "..\\userdata");
+#endif
+    fsu_mkdir(g_user_root, NULL);
 }
-const char *fs_user_root(void) { fs_roots(); return g_user_root; }
+const char *fs_user_root(void) { fs_roots(); return g_user_root_legacy; }
 
-static int is_dir(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
-static int exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
+static int is_dir(const char *p) { DWORD a = fsu_attributes(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
+static int exists(const char *p) { return fsu_attributes(p) != INVALID_FILE_ATTRIBUTES; }
 static void make_parents(const char *path) {             /* creates every missing folder above `path` */
     char tmp[MAX_PATH];
     snprintf(tmp, sizeof tmp, "%s", path);
-    for (char *p = tmp + 3; *p; p++) if (*p == '\\') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '\\'; }
+    for (char *p = tmp + 3; *p; p++) if (*p == '\\') { *p = 0; fsu_mkdir(tmp, NULL); *p = '\\'; }
 }
 static void remove_tree(const char *dir) {
     char pat[MAX_PATH], sub[MAX_PATH];
-    WIN32_FIND_DATAA fd;
+    FsuFindData fd;
     snprintf(pat, sizeof pat, "%s\\*", dir);
-    HANDLE h = FindFirstFileA(pat, &fd);
+    HANDLE h = fsu_find_first(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
             snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(sub);
-            else { SetFileAttributesA(sub, FILE_ATTRIBUTE_NORMAL); DeleteFileA(sub); }
-        } while (FindNextFileA(h, &fd));
+            else { fsu_set_attributes(sub, FILE_ATTRIBUTE_NORMAL); fsu_delete(sub); }
+        } while (fsu_find_next(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryA(dir);
+    fsu_rmdir(dir);
 }
 
 /* ---- tombstones */
@@ -226,9 +235,9 @@ uint32_t fs_delete_directory(const char *guest) {
     int n = fs_dir_roots(guest, roots, &r2);
     for (int i = 0; i < n; i++) {
         char pat[MAX_PATH + 4];
-        WIN32_FIND_DATAA fd;
+        FsuFindData fd;
         snprintf(pat, sizeof pat, "%s\\*", roots[i]);
-        HANDLE h = FindFirstFileA(pat, &fd);
+        HANDLE h = fsu_find_first(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
             if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
@@ -236,16 +245,16 @@ uint32_t fs_delete_directory(const char *guest) {
             if (from_committed && m->work[0] && fs_dir_hidden(guest, fd.cFileName)) continue;       /* deleted in the working state */
             FindClose(h);
             return RESULT_DIRECTORY_NOT_EMPTY;
-        } while (FindNextFileA(h, &fd));
+        } while (fsu_find_next(h, &fd));
         FindClose(h);
     }
     fs_lock();
     if (m->work[0]) {
         char w[MAX_PATH], cm[MAX_PATH];
         join(w, m->work, rel); join(cm, m->root, rel);
-        if (is_dir(w)) RemoveDirectoryA(w);
+        if (is_dir(w)) fsu_rmdir(w);
         if (is_dir(cm)) tomb_add(m, rel);
-    } else r = RemoveDirectoryA(host) ? 0 : RESULT_GENERIC_FAILURE;
+    } else r = fsu_rmdir(host) ? 0 : RESULT_GENERIC_FAILURE;
     fs_unlock();
     return r;
 }
@@ -536,10 +545,10 @@ static HANDLE commit_mutex(void) {
 static void commit_done(HANDLE mx) { if (mx) { ReleaseMutex(mx); CloseHandle(mx); } }
 static void journal_list(FILE *j, const char *work, const char *rel) {     /* every file of the working folder, depth first */
     char dir[MAX_PATH], pat[MAX_PATH], sub[MAX_PATH];
-    WIN32_FIND_DATAA fd;
+    FsuFindData fd;
     join(dir, work, rel);
     snprintf(pat, sizeof pat, "%s\\*", dir);
-    HANDLE h = FindFirstFileA(pat, &fd);
+    HANDLE h = fsu_find_first(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
@@ -548,11 +557,11 @@ static void journal_list(FILE *j, const char *work, const char *rel) {     /* ev
         else {
             char full[MAX_PATH];
             join(full, work, sub);
-            HANDLE f = CreateFileA(full, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+            HANDLE f = fsu_open(full, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
             if (f != INVALID_HANDLE_VALUE) { FlushFileBuffers(f); CloseHandle(f); }
             fprintf(j, "F\t%s\n", sub);
         }
-    } while (FindNextFileA(h, &fd));
+    } while (fsu_find_next(h, &fd));
     FindClose(h);
 }
 /* Applies a decided commit: marker lines are "W <working folder>", "R <committed folder>", then "D rel" (delete),
@@ -560,7 +569,7 @@ static void journal_list(FILE *j, const char *work, const char *rel) {     /* ev
  * running it again. */
 static int journal_apply(const char *marker) {
     char line[MAX_PATH + 8], work[MAX_PATH] = "", root[MAX_PATH] = "", a[MAX_PATH], b[MAX_PATH];
-    FILE *j = fopen(marker, "r");
+    FILE *j = fsu_fopen(marker, "r");
     int n = 0;
     if (!j) return -1;
     while (fgets(line, sizeof line, j)) {
@@ -571,16 +580,16 @@ static int journal_apply(const char *marker) {
         if (line[0] == 'W') snprintf(work, sizeof work, "%s", arg);
         else if (line[0] == 'R') snprintf(root, sizeof root, "%s", arg);
         else if (!root[0] || !work[0]) continue;
-        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else DeleteFileA(a); n++; }
-        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL); }
+        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else fsu_delete(a); n++; }
+        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); fsu_mkdir(a, NULL); }
         else if (line[0] == 'F') {
             join(a, work, arg); join(b, root, arg);
-            if (exists(a)) { make_parents(b); if (!MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { fclose(j); return -2; } }
+            if (exists(a)) { make_parents(b); if (!fsu_move(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { fclose(j); return -2; } }
             n++;
         }
     }
     fclose(j);
-    DeleteFileA(marker);
+    fsu_delete(marker);
     return n;
 }
 static int pid_alive(DWORD pid) {
@@ -594,7 +603,7 @@ static int pid_alive(DWORD pid) {
  * folders and half-written journals of processes that no longer run. */
 static void journal_recover(const char *root) {
     char marker[MAX_PATH], pat[MAX_PATH], path[MAX_PATH];
-    WIN32_FIND_DATAA fd;
+    FsuFindData fd;
     HANDLE mx = commit_mutex();
     snprintf(marker, sizeof marker, "%s.commit", root);
     if (exists(marker)) {
@@ -603,7 +612,7 @@ static void journal_recover(const char *root) {
         trace_printf("     fs journal: interrupted commit of %s rolled forward (%d changes)\n", root, n);
     }
     snprintf(pat, sizeof pat, "%s.*", root);
-    HANDLE h = FindFirstFileA(pat, &fd);
+    HANDLE h = fsu_find_first(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             const char *ext = strrchr(fd.cFileName, '.');
@@ -612,9 +621,9 @@ static void journal_recover(const char *root) {
             DWORD pid = (DWORD)strtoul(ext + 1, NULL, 10);
             if (!pid || pid == GetCurrentProcessId() || pid_alive(pid)) continue;
             snprintf(path, sizeof path, "%s\\..\\%s", root, fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else DeleteFileA(path);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else fsu_delete(path);
             trace_printf("     fs journal: uncommitted %s of process %lu discarded (%s)\n", kind, (unsigned long)pid, fd.cFileName);
-        } while (FindNextFileA(h, &fd));
+        } while (fsu_find_next(h, &fd));
         FindClose(h);
     }
     commit_done(mx);
@@ -633,7 +642,7 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     if (kind != MK_ROM && kind != MK_DIRECT) {             /* a direct folder (sd:) is written at once: no working folder */
         snprintf(m->work, MAX_PATH, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
         remove_tree(m->work);                              /* a second mount in this process starts from the committed state */
-        CreateDirectoryA(m->work, NULL);
+        fsu_mkdir(m->work, NULL);
     }
     m->kind = kind;
     fs_unlock();
@@ -662,7 +671,7 @@ static void fs_MountSaveData(Ctx *c) {                   /* (const char *name, c
 static void fs_MountCacheStorage(Ctx *c) {               /* (const char *name): the application's cache storage, created on first use */
     char dir[MAX_PATH];
     save_dir(dir, "cache");
-    CreateDirectoryA(dir, NULL);
+    fsu_mkdir(dir, NULL);
     journal_recover(dir);
     uint32_t r = mount_add(STR(0), MK_CACHE, dir);
     trace_printf("     fs mount cache storage \"%s\" -> %s (%x)\n", STR(0), dir, r);
@@ -696,7 +705,7 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
 static void fs_EnsureSaveData(Ctx *c) {                  /* (const Uid &): creates the user's save data if there is none */
     char dir[MAX_PATH];
     save_dir(dir, "save");
-    RET(CreateDirectoryA(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : RESULT_GENERIC_FAILURE);
+    RET(fsu_mkdir(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : RESULT_GENERIC_FAILURE);
 }
 static void fs_IsSaveDataExisting(Ctx *c) { RET(save_exists()); }
 static void fs_Commit(Ctx *c) {                          /* (const char *mount name) */
@@ -712,7 +721,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     HANDLE mx = commit_mutex();
     snprintf(journal, sizeof journal, "%s.journal.%lu", m->root, (unsigned long)GetCurrentProcessId());
     snprintf(marker, sizeof marker, "%s.commit", m->root);
-    FILE *j = fopen(journal, "w");
+    FILE *j = fsu_fopen(journal, "w");
     int ok = j != NULL, changes = -1;
     if (ok) {
         fprintf(j, "W\t%s\nR\t%s\n", m->work, m->root);
@@ -721,7 +730,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
         ok = fflush(j) == 0 && FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(j)));
         fclose(j);
     }
-    if (ok) ok = MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);      /* the commit is decided here */
+    if (ok) ok = fsu_move(journal, marker, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);      /* the commit is decided here */
     if (ok) { changes = journal_apply(marker); ok = changes >= 0; }
     if (ok) tomb_clear(m);
     commit_done(mx);
@@ -745,24 +754,21 @@ static uint32_t romfs_buckets(uint32_t n) {
     return n;
 }
 static void romfs_walk(const char *dir, uint32_t *dirs, uint32_t *files, uint64_t *dir_bytes, uint64_t *file_bytes) {
-    wchar_t wpat[MAX_PATH + 4];
     char pat[MAX_PATH + 4], sub[MAX_PATH], utf8[1024];
-    WIN32_FIND_DATAW fd;
+    FsuFindData fd;
     snprintf(pat, sizeof pat, "%s\\*", dir);
-    MultiByteToWideChar(CP_ACP, 0, pat, -1, wpat, MAX_PATH + 4);
-    HANDLE h = FindFirstFileW(wpat, &fd);
+    HANDLE h = fsu_find_first(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-        int len = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, utf8, sizeof utf8, NULL, NULL) - 1;
-        if (len < 0) len = 0;
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        size_t len = strlen(fd.cFileName);
+        snprintf(utf8, sizeof utf8, "%s", fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             (*dirs)++; *dir_bytes += 0x18 + (uint64_t)((len + 3) & ~3);
-            WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1, utf8, sizeof utf8, NULL, NULL);
             snprintf(sub, sizeof sub, "%s\\%s", dir, utf8);
             romfs_walk(sub, dirs, files, dir_bytes, file_bytes);
         } else { (*files)++; *file_bytes += 0x20 + (uint64_t)((len + 3) & ~3); }
-    } while (FindNextFileW(h, &fd));
+    } while (fsu_find_next(h, &fd));
     FindClose(h);
 }
 static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
@@ -793,13 +799,13 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
         else if (write && m->work[0]) {                    /* copy-on-write: the committed file is never opened for writing */
             char w[MAX_PATH];
             join(w, m->work, rel);
-            if (_stricmp(w, path) != 0) { make_parents(w); if (!CopyFileA(path, w, TRUE)) r = RESULT_GENERIC_FAILURE; }
+            if (_stricmp(w, path) != 0) { make_parents(w); if (!fsu_copy(path, w, TRUE)) r = RESULT_GENERIC_FAILURE; }
             strcpy(path, w);
         }
     }
     fs_unlock();
     if (!r) {
-        h = CreateFileA(path, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        h = fsu_open(path, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) r = RESULT_PATH_NOT_FOUND;
     }
     if (InterlockedIncrement(&g_open_log) <= 200 || r)     /* D2: every failed open is logged, not only the first 200 */
@@ -958,7 +964,7 @@ static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
     fs_lock();
     uint32_t r = create_target(STR(0), &m, rel, path);
     if (!r) {
-        HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE h = fsu_open(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) r = RESULT_GENERIC_FAILURE;
         else {
             LARGE_INTEGER size;
@@ -980,10 +986,10 @@ static void fs_DeleteFile(Ctx *c) {
     uint32_t r = split_path(STR(0), &m, rel);
     if (!r && m->kind == MK_ROM) r = RESULT_PERMISSION_DENIED;
     if (!r && (!view_path(m, rel, path) || is_dir(path))) r = RESULT_PATH_NOT_FOUND;
-    if (!r && !m->work[0]) r = DeleteFileA(path) ? 0 : RESULT_GENERIC_FAILURE;   /* a plain folder: at once */
+    if (!r && !m->work[0]) r = fsu_delete(path) ? 0 : RESULT_GENERIC_FAILURE;   /* a plain folder: at once */
     else if (!r) {
         join(w, m->work, rel); join(cm, m->root, rel);
-        if (exists(w)) DeleteFileA(w);
+        if (exists(w)) fsu_delete(w);
         if (exists(cm)) tomb_add(m, rel);
     }
     fs_unlock();
@@ -995,7 +1001,7 @@ static void fs_CreateDirectory(Ctx *c) {
     FSA_PATH_CALL(STR(0), "create directory", 4, 0, 0);
     fs_lock();
     uint32_t r = create_target(STR(0), &m, rel, path);
-    if (!r && !CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) r = RESULT_GENERIC_FAILURE;
+    if (!r && !fsu_mkdir(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) r = RESULT_GENERIC_FAILURE;
     fs_unlock();
     RET(r);
 }
@@ -1037,13 +1043,13 @@ static uint32_t host_rename(const char *from, const char *to, int want_dir) {
     if (!r && (!ra[0] || !view_path(ma, ra, pa) || is_dir(pa) != want_dir)) r = RESULT_PATH_NOT_FOUND;
     if (!r && (!rb[0] || view_path(ma, rb, host))) r = RESULT_PATH_ALREADY_EXISTS;
     if (!r && !view_parent_is_dir(ma, rb)) r = RESULT_PATH_NOT_FOUND;
-    if (!r && !ma->work[0]) { join(pb, ma->root, rb); r = MoveFileExA(pa, pb, 0) ? 0 : RESULT_GENERIC_FAILURE; }
+    if (!r && !ma->work[0]) { join(pb, ma->root, rb); r = fsu_move(pa, pb, 0) ? 0 : RESULT_GENERIC_FAILURE; }
     else if (!r && want_dir) r = RESULT_UNSUPPORTED;
     else if (!r) {
         char w[MAX_PATH], cm[MAX_PATH];
         join(pb, ma->work, rb); make_parents(pb);
         join(w, ma->work, ra); join(cm, ma->root, ra);
-        r = (_stricmp(pa, w) == 0 ? MoveFileExA(w, pb, 0) : CopyFileA(pa, pb, TRUE)) ? 0 : RESULT_GENERIC_FAILURE;
+        r = (_stricmp(pa, w) == 0 ? fsu_move(w, pb, 0) : fsu_copy(pa, pb, TRUE)) ? 0 : RESULT_GENERIC_FAILURE;
         if (!r && exists(cm)) tomb_add(ma, ra);
     }
     fs_unlock();
@@ -1090,7 +1096,7 @@ uint32_t fs_mount_plain(const char *name, const char *host_dir) { fs_roots(); re
 uint32_t fs_mount_direct(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_DIRECT, host_dir); }   /* skyline.c: sd: */
 static int st_host_is(const char *path, const char *text) {
     char buf[64] = "";
-    FILE *f = fopen(path, "rb");
+    FILE *f = fsu_fopen(path, "rb");
     if (!f) return text == NULL;
     size_t n = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
@@ -1124,16 +1130,16 @@ int nnfs_selftest(Ctx *c) {
     #define FSCHECK(cond, text) do { if (!(cond)) { printf("  FAIL fs journal: %s\n", text); bad++; } } while (0)
     fs_roots();
     strcpy(saved_root, g_user_root);
-    GetTempPathA(MAX_PATH - 64, t);
+    fsu_temp(MAX_PATH - 64, t);
     snprintf(t + strlen(t), 64, "ssbu_fs_selftest_%lu", (unsigned long)GetCurrentProcessId());
     remove_tree(t);
-    CreateDirectoryA(t, NULL);
+    fsu_mkdir(t, NULL);
     strcpy(g_user_root, t);
-    snprintf(save, sizeof save, "%s\\save", t); CreateDirectoryA(save, NULL);
+    snprintf(save, sizeof save, "%s\\save", t); fsu_mkdir(save, NULL);
     snprintf(a, sizeof a, "%s\\a.bin", save); snprintf(n, sizeof n, "%s\\sub\\new.bin", save);
     snprintf(work, sizeof work, "%s.work.%lu", save, (unsigned long)GetCurrentProcessId());
     snprintf(marker, sizeof marker, "%s.commit", save); snprintf(journal, sizeof journal, "%s.journal.%lu", save, (unsigned long)GetCurrentProcessId());
-    FILE *f = fopen(a, "wb"); if (f) { fputs("committed", f); fclose(f); }
+    FILE *f = fsu_fopen(a, "wb"); if (f) { fputs("committed", f); fclose(f); }
 
     c->x[0] = (uint64_t)(uintptr_t)"nosuch:/a.bin"; c->x[1] = 0; fs_CreateFile(c);
     FSCHECK(c->x[0] == RESULT_NOT_MOUNTED, "a path with an unmounted name is not NotMounted");
@@ -1173,9 +1179,9 @@ int nnfs_selftest(Ctx *c) {
     FSCHECK(c->x[0] == 0 && !exists(n), "a committed deletion did not reach the host");
     /* 5. a process killed after the commit was decided: the next mount finishes it */
     FSCHECK(st_write(c, "st:/a.bin", "THIRD!!!!", NULL) == 0, "write failed");
-    f = fopen(journal, "w");
+    f = fsu_fopen(journal, "w");
     if (f) { fprintf(f, "W\t%s\nR\t%s\n", work, save); journal_list(f, work, ""); fclose(f); }
-    MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING);
+    fsu_move(journal, marker, MOVEFILE_REPLACE_EXISTING);
     FSCHECK(st_host_is(a, "SECOND!!!") && exists(marker), "test setup: decided commit");
     journal_recover(save);
     FSCHECK(st_host_is(a, "THIRD!!!!") && !exists(marker), "a decided commit was not rolled forward at the next mount");
@@ -1183,9 +1189,9 @@ int nnfs_selftest(Ctx *c) {
     {
         char dead[MAX_PATH];
         snprintf(dead, sizeof dead, "%s.work.4294967294", save);
-        CreateDirectoryA(dead, NULL);
+        fsu_mkdir(dead, NULL);
         snprintf(dead + strlen(dead), 32, "\\a.bin");
-        f = fopen(dead, "wb"); if (f) { fputs("LOST", f); fclose(f); }
+        f = fsu_fopen(dead, "wb"); if (f) { fputs("LOST", f); fclose(f); }
         journal_recover(save);
         dead[strlen(dead) - 6] = 0;
         FSCHECK(!exists(dead) && st_host_is(a, "THIRD!!!!"), "the working folder of a dead process was not discarded");
@@ -1230,31 +1236,21 @@ static int ini_player_name(char *out, size_t n) {          /* `player_name = <na
     fclose(f);
     return found;
 }
-/* The nickname of the console user: SSBU_NICKNAME, else the name chosen in the settings menu (graphics.ini player_name),
- * else the name of the Windows user: UTF-8, at most 32 bytes, NUL-terminated, in the 33-byte Nickname. */
+/* Explicit game identity; never derive it from the Windows account. */
 static void acc_GetNickname(Ctx *c) {
-    static char name[33];
-    static volatile LONG ready;
-    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
-        const char *env = getenv("SSBU_NICKNAME");
-        char utf8[512] = "";
-        if (env && env[0]) snprintf(utf8, sizeof utf8, "%s", env);
-        else if (ini_player_name(utf8, sizeof utf8)) {}                  /* F1 > Experimental > Your name (graphics.ini player_name) */
-        else {
-            wchar_t wname[257] = L"";
-            DWORD n = 257;
-            if (GetUserNameW(wname, &n)) WideCharToMultiByte(CP_UTF8, 0, wname, -1, utf8, sizeof utf8, NULL, NULL);
-        }
-        if (!utf8[0]) strcpy(utf8, "Player");
-        size_t len = strlen(utf8);
-        if (len > 32) { len = 32; while (len > 0 && ((unsigned char)utf8[len] & 0xc0) == 0x80) len--; }   /* cut between characters */
-        memcpy(name, utf8, len);
-        name[len] = 0;
-        ready = 2;
-    }
-    while (ready != 2) SwitchToThread();
+#if SSBU_ENABLE_YUZU
+    void ssbu_net_get_profile(char out[33]);
+    ssbu_net_get_profile((char *)(uintptr_t)A0);
+#else
+    char utf8[512] = "";
+    const char *chosen = getenv("SSBU_NICKNAME");
+    if (chosen && *chosen) snprintf(utf8, sizeof utf8, "%s", chosen);
+    else ini_player_name(utf8, sizeof utf8);
     memset((void *)(uintptr_t)A0, 0, 33);
-    strcpy((char *)(uintptr_t)A0, name);
+    /* Reject invalid/oversize UTF-8 rather than cutting a multibyte character. */
+    if (strlen(utf8) <= 32 && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, NULL, 0))
+        memcpy((void *)(uintptr_t)A0, utf8, strlen(utf8));
+#endif
     RET(0);
 }
 static void acc_out_true(Ctx *c) { wr8(A0, 1); RET(0); }

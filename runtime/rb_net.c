@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #endif
 #include "rb.h"
+#include "network_protocol.h"
 #include "rb_input.c"
 #include "rb_wire.c"
 #include "rb_timesync.c"
@@ -51,6 +52,11 @@ int rbn_on(void) {
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }
+    /* Yuzu peers use the game's original netcode; this is an exclusion, not a rollback adapter. */
+    if (!g_loop && network_protocol() != SSBU_PROTOCOL_UPSTREAM) {
+        printf("[rbnet] network rollback unavailable for the selected connection protocol\n");
+        return g_on = 0;
+    }
     g_local = 0;
     if (!g_loop && net_online() && net_mode() == 3) g_local = 1;      /* NET_MODE_JOIN */
     if ((e = getenv("SSBU_RB_NET_PLAYER"))) g_local = atoi(e) ? 1 : 0;

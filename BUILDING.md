@@ -302,6 +302,10 @@ instead (the OpenGL path always does).
 Dear ImGui (MIT, https://github.com/ocornut/imgui) is compiled into the runtime when found, as described above; its licence
 text stays in the downloaded folder.
 
+To run the build on other PCs: `python scripts/package.py` makes a folder that starts without Python or the build tools,
+with a launcher that writes a log folder and a report zip (system, log, input recording, save, minidump) for every run, and
+replays a report on this PC: [docs/PACKAGING.md](docs/PACKAGING.md).
+
 ## Troubleshooting
 
 - `[tools] FAILED: ... the Microsoft C++ Build Tools, which are missing`: read the sentence before it first: it says why
@@ -335,3 +339,52 @@ text stays in the downloaded folder.
 - A compiler job that fails after a power loss or while the PC is under load: run the same command again; only what
   changed is rebuilt. Closing a running game first matters: a running exe holds its DLLs open and the link fails.
 - Output with non-ASCII characters from Windows tools is shown with `?`; the logs in `build/logs` are the originals.
+
+
+## Native resource mods and Console management
+
+Resource loading uses the upstream Skyline / ARCropolis pipeline documented in [SKYLINE.md](docs/SKYLINE.md).
+Console manages packages in its configured SD, independently of plugin preparation; see [MOD_RESOURCES.md](docs/MOD_RESOURCES.md).
+`--with-mods` is retired and rejected. `--without-mods` is a compatibility no-op; use `SSBU_SKYLINE=0` to disable the upstream loader.
+The personal resource DLL, build script and virtual archive engine are no longer part of this branch.
+The exact host record keeps `resource_mods=false` and records `skyline_loader=true`; this is capability metadata, not a claim that a plugin's hooks are active.
+
+## Optional extensions on yuzu
+
+These extensions belong to the personal `yuzu` branch. `main` mirrors the upstream original; do not merge
+`yuzu` or its feature branches into `main` unless the user explicitly changes this repository policy.
+
+The optional online delay controls default to **off**. Build with `--with-latency-slider`, or return to `--without-latency-slider`.
+Changing that choice relinks the host and invalidates its previous check. Enabling it requires MSVC Build Tools and the pinned WebView2 SDK.
+The renderer's existing MSVC requirement still applies. Skyline preparation is independent of this delay control option.
+An upstream prebuilt runtime (`--runtime`) cannot supply these delay controls. Use a source build with
+`--with-latency-slider`, or disable them with `--without-latency-slider` when installing an upstream runtime.
+The incompatible combination is rejected before the runtime package is unpacked or copied.
+
+The delay plugin is built to `build/work/plugins/latency_slider.dll`; its Console overlay, assets and licenses
+are in `build/work/net_delay/`. The enabled host loads its own plugin relative to the executable, including when
+started directly or through Console. The setting defaults to `build/config/online-delay.ini` (or the package's
+`config/online-delay.ini`); `SSBU_NET_DELAY_CONFIG` overrides it. The initial selection is Auto. The original
+13.0.4 fingerprint and live LDN peer checks remain in effect. `SSBU_NET_DELAY_UI=off` hides only the overlay.
+
+A host built with `--without-latency-slider` omits automatic loading and refuses the delay plugin in `SSBU_MODS`,
+even if an older DLL remains in that directory. General fighter SDK plugins remain independent.
+
+`*.build.json` records the selected capabilities and the exact executable hash. `scripts/package.py` reads this record,
+includes enabled extension artifacts and licenses, and leaves disabled extension leftovers out of the package.
+To link a staged host manually, `build.py link` accepts the same delay switches; build enabled extension
+artifacts with the setup link step first. The default manual link disables delay controls.
+
+
+## Portable Console updates (personal yuzu build)
+
+Build the trusted update/recovery helper before Console; Console embeds that exact helper:
+
+```powershell
+$env:CARGO_TARGET_DIR = "$PWD/build/updater-target"
+cargo build --manifest-path tools/updater/Cargo.toml --release --no-default-features --locked
+$env:CARGO_TARGET_DIR = "$PWD/build/console-target"
+cargo build --manifest-path tools/console/Cargo.toml --release --locked
+```
+
+`python scripts/package.py --public --zip` excludes data.arc, shader caches, personal/smoke saves and local config, and removes local manifest paths. It retains the normal current-build checks. The update protocol and release command are documented in `docs/PORTABLE_UPDATER_2026-10-19.md`; `scripts/release_update.py --help` builds signed full/file updates from verified portable directories. Keys are never bundled, and generating release artifacts does not upload or publish them.

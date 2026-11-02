@@ -181,6 +181,10 @@ static ImportFn h(const char *name) {
 }
 #include "nnnet_c4a.inc"
 #include "nnsvc_c5a.inc"
+#include "network_protocol.h"
+#if SSBU_ENABLE_YUZU
+#include "nnnet_yuzu.inc"
+#endif
 int nnnet_selftest(Ctx *c) {
     int bad = 0, ok;
     bad += c4a_selftest(c);

@@ -20,6 +20,7 @@
 #include <string.h>
 #include <windows.h>
 #include "sdklift.h"
+#include "fs_host.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -79,21 +80,18 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
     d->magic = DIR_MAGIC;
     for (int r = 0; r < nroots; r++) {
         snprintf(pattern, sizeof pattern, "%s\\*", roots[r]);
-        WIN32_FIND_DATAW fd;
-        wchar_t wpattern[MAX_PATH + 4];
-        MultiByteToWideChar(CP_ACP, 0, pattern, -1, wpattern, MAX_PATH + 4);
-        HANDLE h = FindFirstFileW(wpattern, &fd);
+        FsuFindData fd;
+        HANDLE h = fsu_find_first(pattern, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
-            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
             int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, dup = 0;
             char name[0x301];
             memset(name, 0, sizeof name);
-            if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, 0x300, NULL, NULL)) continue;
+            if (strlen(fd.cFileName) >= sizeof name) continue;
+            strcpy(name, fd.cFileName);
             if (r == nroots - 1 && nroots == 2) {            /* committed folder under a working folder: skip what the working state replaced or deleted */
-                char ansi[MAX_PATH];
-                WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1, ansi, sizeof ansi, NULL, NULL);
-                if (fs_dir_hidden((const char *)(uintptr_t)A1, ansi)) continue;
+                if (fs_dir_hidden((const char *)(uintptr_t)A1, name)) continue;
             }
             for (int k = 0; k < d->count && !dup; k++) dup = _stricmp(d->entries[k].name, name) == 0;
             if (dup) continue;
@@ -107,7 +105,7 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
             e->is_file = !is_dir;
             e->size = is_dir ? 0 : (int64_t)(((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
             d->count++;
-        } while (FindNextFileW(h, &fd));
+        } while (fsu_find_next(h, &fd));
         FindClose(h);
     }
     if (nroots == 2) {                                       /* drop the entries the open mode does not ask for */
@@ -180,15 +178,15 @@ int nnfsdir_selftest(Ctx *c) {
     int ok = 1;
     char base[MAX_PATH], p[MAX_PATH];
     uint32_t fs_mount_plain(const char *name, const char *host_dir);
-    GetTempPathA(MAX_PATH - 64, base);
+    fsu_temp(MAX_PATH - 64, base);
     snprintf(base + strlen(base), 64, "ssbu_fsdir_selftest_%lu", (unsigned long)GetCurrentProcessId());
-    CreateDirectoryA(base, NULL);
-    snprintf(p, sizeof p, "%s\\d", base); CreateDirectoryA(p, NULL);
-    snprintf(p, sizeof p, "%s\\d\\sub", base); CreateDirectoryA(p, NULL);
+    fsu_mkdir(base, NULL);
+    snprintf(p, sizeof p, "%s\\d", base); fsu_mkdir(p, NULL);
+    snprintf(p, sizeof p, "%s\\d\\sub", base); fsu_mkdir(p, NULL);
     snprintf(p, sizeof p, "%s\\d\\a.bin", base);
-    FILE *f = fopen(p, "wb"); if (f) { fwrite("12345", 1, 5, f); fclose(f); }
+    FILE *f = fsu_fopen(p, "wb"); if (f) { fwrite("12345", 1, 5, f); fclose(f); }
     snprintf(p, sizeof p, "%s\\d\\b.bin", base);
-    f = fopen(p, "wb"); if (f) fclose(f);
+    f = fsu_fopen(p, "wb"); if (f) fclose(f);
     ok = fs_mount_plain("sdkselftest", base) == 0;
     static const int expect[4] = {0, 1, 2, 3};
     for (int mode = 1; mode <= 3; mode++) {
@@ -223,13 +221,13 @@ int nnfsdir_selftest(Ctx *c) {
     ok = ok && c->x[0] == RESULT_PATH_NOT_FOUND && handle == 0;
     c->x[0] = P("sdkselftest:/d"); fs_DeleteDirectory(c);
     ok = ok && c->x[0] != 0;                               /* not empty */
-    snprintf(p, sizeof p, "%s\\d\\a.bin", base); DeleteFileA(p);
-    snprintf(p, sizeof p, "%s\\d\\b.bin", base); DeleteFileA(p);
+    snprintf(p, sizeof p, "%s\\d\\a.bin", base); fsu_delete(p);
+    snprintf(p, sizeof p, "%s\\d\\b.bin", base); fsu_delete(p);
     c->x[0] = P("sdkselftest:/d/sub"); fs_DeleteDirectory(c);
     ok = ok && c->x[0] == 0;
     c->x[0] = P("sdkselftest:/d"); fs_DeleteDirectory(c);
     ok = ok && c->x[0] == 0;
-    RemoveDirectoryA(base);
+    fsu_rmdir(base);
     printf("  fs: OpenDirectory / GetDirectoryEntryCount / ReadDirectory (modes 1, 2, 3; 0x310-byte entries) / DeleteDirectory: %s\n", ok ? "ok" : "FAILED");
     return !ok;
 }

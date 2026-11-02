@@ -14,6 +14,7 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "nnpad.h"
+#include "input_trace.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -590,7 +591,7 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
                    if (r1_on() && r1_poll(mark_seen("fight") ? nt : 0)) nt = 0;                  /* R1 re-run: the sequence waits, the recorded values are given (R1 run-ahead: the speculative poll) */
                    fight_shot_poll(nt); if (mark_seen("fight")) l1_ticks += nt;
                    for (int n = nt; n > 0; n--) seq_tick(); }     /* S11: 1 per poll; SSBU_DETERMINISTIC in a fight: per fight frame (fighter_sdk\fighter_host.c) */
-    if (!player_connected(id)) return;
+    if (!player_connected(id)) { input_trace_pad(id, (const void *)(uintptr_t)out); return; }
     static const struct { int vk, bit; } map[] = {
         {'Z', BTN_A}, {'X', BTN_B}, {'C', BTN_X}, {'V', BTN_Y}, {'Q', BTN_L}, {'E', BTN_R}, {'A', BTN_ZL}, {'S', BTN_ZR},
         {VK_RETURN, BTN_PLUS}, {VK_BACK, BTN_MINUS}, {'J', BTN_LEFT}, {'I', BTN_UP}, {'L', BTN_RIGHT}, {'K', BTN_DOWN},
@@ -654,6 +655,7 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
     wr32(out + 0x1c, (uint32_t)ry);
     wr32(out + 0x20, wired ? 3 : 1);                          /* NpadAttribute: bit 0 connected, bit 1 wired */
     if (kind == 2) { wr32(out + 0x24, trig_l); wr32(out + 0x28, trig_r); }
+    input_trace_pad(id, (const void *)(uintptr_t)out);
 }
 
 /* Our own menus and the on-screen keyboard (osk.c): the buttons of EVERY connected pad together, in the Npad bit order
@@ -776,6 +778,36 @@ static void hid_GetTouchScreenState(Ctx *c) {               /* docked console: t
     memset((void *)(uintptr_t)A0, 0, 0x290);
     wr64(A0, (uint64_t)InterlockedIncrement64(&g_sampling));
 }
+/* The host keyboard is exposed as an Npad above. Separate console USB keyboard /
+ * mouse peripherals are not attached; keep their independent HID states empty.
+ * Layouts: keyboard 0x30, mouse 0x28 (libnx hid.h); TouchScreenState<1> is 0x38,
+ * so routing it to the game's <16> handler would overwrite the plugin's buffer. */
+static void hid_InitializePeripheral(Ctx *c) { (void)c; }
+static void hid_empty_peripheral(Ctx *c, size_t bytes) {
+    memset((void *)(uintptr_t)A0, 0, bytes);
+    wr64(A0, (uint64_t)InterlockedIncrement64(&g_sampling));
+}
+static void hid_GetKeyboardState(Ctx *c) { hid_empty_peripheral(c, 0x30); }
+static void hid_GetMouseState(Ctx *c) { hid_empty_peripheral(c, 0x28); }
+static void hid_GetTouchScreenState1(Ctx *c) { hid_empty_peripheral(c, 0x38); }
+static int hid_plugin_state_selftest(Ctx *c) {
+    uint64_t saved = A0;
+    ImportFn readers[] = {hid_GetKeyboardState, hid_GetMouseState, hid_GetTouchScreenState1};
+    const size_t sizes[] = {0x30, 0x28, 0x38};
+    unsigned char guarded[0x58]; int ok = 1;
+    for (int k = 0; k < 3; k++) {
+        memset(guarded, 0xa5, sizeof guarded); A0 = (uint64_t)(uintptr_t)(guarded + 8);
+        readers[k](c);
+        ok &= rd64(A0) != 0;
+        for (size_t i = 0; i < sizeof guarded; i++) {
+            if (i >= 8 && i < 16) continue;
+            ok &= guarded[i] == (i >= 16 && i < 8 + sizes[k] ? 0 : 0xa5);
+        }
+    }
+    A0 = saved;
+    printf("  hid: plugin keyboard/mouse disconnected and docked TouchScreenState<1>, exact sizes with guards: %s\n", ok ? "ok" : "FAILED");
+    return !ok;
+}
 /* Motion: XInput pads have no sensor. The state written is that of a controller lying still, face up: no rotation,
  * identity attitude, gravity on -z (NOT VERIFIED on a console: the sign convention), attribute "connected". */
 /* The SDK side, read in sdk.elf:
@@ -847,7 +879,7 @@ int nnhid_selftest(Ctx *c) {
     memset(&g_six[6], 0, sizeof g_six[6]);
     c->x[30] = lr;
     printf("  hid: six-axis state: empty ring copies nothing, last record kept after disconnect, record at rest: %s\n", ok ? "ok" : "FAILED");
-    { int nnhid_selftest_xinput(Ctx *c); return !ok + nnhid_selftest_close4(c) + nnhid_selftest_xinput(c); }
+    { int nnhid_selftest_xinput(Ctx *c); return !ok + hid_plugin_state_selftest(c) + nnhid_selftest_close4(c) + nnhid_selftest_xinput(c); }
 }
 /* IsSixAxisSensorAtRest(const SixAxisSensorHandle &) [sdk 0x250b80 -> 0x23beb0]: one request to the hid module (IHidServer
  * slot +0x138 = command 82, [doc] suyu hid_server.cpp) with the handle; a failure aborts (0x250b9c), else the module's bool
@@ -1241,6 +1273,9 @@ int nnhid_pad_selftest(void) {
 
 #define H(n) "_ZN2nn3hid" n
 static const ImportDef hid_imports[] = {
+    {H("18InitializeKeyboardEv"), hid_InitializePeripheral}, {H("15InitializeMouseEv"), hid_InitializePeripheral},
+    {H("16GetKeyboardStateEPNS0_13KeyboardStateE"), hid_GetKeyboardState}, {H("13GetMouseStateEPNS0_10MouseStateE"), hid_GetMouseState},
+    {H("19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE"), hid_GetTouchScreenState1},
     {H("14InitializeNpadEv"), hid_InitializeNpad}, {H("24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE"), hid_SetSupportedNpadStyleSet},
     {H("22SetSupportedNpadIdTypeEPKjm"), hid_SetSupportedNpadIdType}, {H("18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE"), hid_joycon_only},
     {H("20GetNpadJoyAssignmentERKj"), hid_GetNpadJoyAssignment}, {H("30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE"), hid_joycon_only},

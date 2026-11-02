@@ -1,3 +1,4 @@
+#include "fs_host.h"
 /* skyline.c - Skyline for this port: the plugin loader and the API that Skyline plugins (ARCropolis, smashline, nro_hook,
  * HewDraw Remix, ...) import. #included by nnro.c (it uses the module tables, the loader and the hook table).
  *
@@ -67,26 +68,49 @@ static void sky_site(const char *fmt, ...) {     /* one line of skyline_sites.lo
 }
 
 static void exe_dir(char *out, size_t n) {
-    DWORD k = GetModuleFileNameA(NULL, out, (DWORD)n);
+    DWORD k = fsu_module_path(NULL, out, (DWORD)n);
     while (k && out[k - 1] != '\\' && out[k - 1] != '/') k--;
     out[k] = 0;
 }
 
 /* ---------------------------------------------------------------- the plugin registry (plugin_bin\plugins.txt) */
 static int hexval(int ch) { return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1; }
-static const char *sky_bin_dir(void) { const char *b = getenv("SSBU_PLUGIN_BIN"); return b && b[0] ? b : "plugin_bin"; }
+#ifdef _WIN32
+static char g_sky_bin[MAX_PATH];
+static BOOL CALLBACK sky_bin_once(PINIT_ONCE once, PVOID p, PVOID *ctx) {
+    (void)once; (void)p; (void)ctx;
+    int present = fsu_env(L"SSBU_PLUGIN_BIN", g_sky_bin, sizeof g_sky_bin);
+    if (present < 0) guest_trap("Skyline: plugin folder path is too long", 0);
+    if (!present) strcpy(g_sky_bin, "plugin_bin");
+    return TRUE;
+}
+#endif
+static const char *sky_bin_dir(void) {
+#ifdef _WIN32
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, sky_bin_once, NULL, NULL);
+    return g_sky_bin;
+#else
+    const char *b = getenv("SSBU_PLUGIN_BIN"); return b && b[0] ? b : "plugin_bin";
+#endif
+}
 static BOOL CALLBACK sky_registry_once(PINIT_ONCE once, PVOID p, PVOID *ctx) {
     (void)once; (void)p; (void)ctx;
     char path[MAX_PATH * 2], line[MAX_PATH * 2];
     const char *sd = getenv("SSBU_SD");
+#ifdef _WIN32
+    char sd_utf8[MAX_PATH];
+    if (fsu_env(L"SSBU_SD", sd_utf8, sizeof sd_utf8) < 0) guest_trap("Skyline: SD path is too long", 0);
+    sd = sd_utf8;
+#endif
     exe_dir(path, sizeof path);
     if (sd && sd[0]) snprintf(g_sky_sd, sizeof g_sky_sd, "%s", sd);
     else snprintf(g_sky_sd, sizeof g_sky_sd, "%s..\\..\\sd", path);
     {   char dir[MAX_PATH * 2]; snprintf(dir, sizeof dir, "%s\\" SKY_PLUGIN_DIR, g_sky_sd);
-        DWORD a = GetFileAttributesA(dir);
+        DWORD a = fsu_attributes(dir);
         if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY) || (getenv("SSBU_SKYLINE") && !strcmp(getenv("SSBU_SKYLINE"), "0"))) { g_sky_sd[0] = 0; return TRUE; } }
     snprintf(path + strlen(path), sizeof path - strlen(path), "%s\\plugins.txt", sky_bin_dir());
-    FILE *f = fopen(path, "r");
+    FILE *f = fsu_fopen(path, "r");
     if (!f) { printf("[skyline] %s is missing: no plugin has lifted code (tools/nro/build_plugins.py)\n", path); return TRUE; }
     while (fgets(line, sizeof line, f) && g_sky_count < SKY_MAX_PLUGINS) {
         char name[128], bid[64], src[MAX_PATH];
@@ -521,16 +545,16 @@ static const ImportDef sky_imports[] = {
 typedef struct { char path[MAX_PATH]; } SkyFile;
 static int sky_cmp_file(const void *a, const void *b) { return _stricmp(((const SkyFile *)a)->path, ((const SkyFile *)b)->path); }
 static void sky_scan(const char *dir, SkyFile *out, int *n, int cap) {          /* recursive, like Skyline's walk */
-    char pat[MAX_PATH * 2]; WIN32_FIND_DATAA fd;
+    char pat[MAX_PATH * 2]; FsuFindData fd;
     snprintf(pat, sizeof pat, "%s\\*", dir);
-    HANDLE h = FindFirstFileA(pat, &fd);
+    HANDLE h = fsu_find_first(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.cFileName[0] == '.') continue;
         char p[MAX_PATH * 2]; snprintf(p, sizeof p, "%s\\%s", dir, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) sky_scan(p, out, n, cap);
         else if (*n < cap) snprintf(out[(*n)++].path, MAX_PATH, "%s", p);
-    } while (FindNextFileA(h, &fd));
+    } while (fsu_find_next(h, &fd));
     FindClose(h);
 }
 
@@ -558,7 +582,7 @@ static DWORD WINAPI sky_boot_thread(LPVOID arg) {
     NroModule *mods[SKY_MAX_PLUGINS];
     int nm = 0;
     for (int i = 0; i < nf; i++) {
-        FILE *f = fopen(files[i].path, "rb");
+        FILE *f = fsu_fopen(files[i].path, "rb");
         if (!f) continue;
         fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
         uint8_t *img = VirtualAlloc(NULL, (SIZE_T)((size + 0xfff) & ~0xfff), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -596,7 +620,7 @@ static void sky_MountRom(Ctx *c) {               /* the game's first MountRom: p
     uint64_t result = c->x[0];
     if (sky_registry() > 0) {
         char log[MAX_PATH * 2]; exe_dir(log, sizeof log); strncat(log, "skyline_sites.log", sizeof log - strlen(log) - 1);
-        g_sky_log = fopen(log, "w");
+        g_sky_log = fsu_fopen(log, "w");
         if (g_sky_log) fprintf(g_sky_log, "# sites the plugins hooked / patched in this run (re-lift site list format; tools/lifter/relift_sites.py)\n");
         { uint32_t fs_mount_direct(const char *name, const char *host_dir); uint32_t r = fs_mount_direct("sd", g_sky_sd);
           sky_logf("sd:/ = %s (mount result 0x%x); %d plugins have lifted code", g_sky_sd, r, g_sky_count); }
@@ -615,7 +639,20 @@ static void ro_LookupSymbol(Ctx *c) {            /* (uintptr_t *out, const char 
     const char *name = (const char *)(uintptr_t)c->x[1];
     const Export *e = exp_find(name);
     uint64_t a = e ? e->value : 0;
-    if (!a) { int mi = main_find(name); if (mi >= 0 && dyn_syms[mi].defined) a = GUEST_BASE + dyn_syms[mi].value; }
+    if (!a) {
+        int mi = main_find(name);
+        if (mi >= 0 && dyn_syms[mi].defined) a = GUEST_BASE + dyn_syms[mi].value;
+        else {
+            /* SDK exports implemented by the host are visible to LookupSymbol too.
+             * Reuse main's import address so installed hook layers remain in force. */
+            ImportFn fn = import_lookup(name);
+            if (fn && mi >= 0) a = IMPORT_BASE + (uint64_t)mi * IMPORT_SLOT;
+            else {
+                if (!fn) fn = extra_import_lookup(name);
+                if (fn) a = hostfn_address(name, fn);
+            }
+        }
+    }
     wr64(c->x[0], a);
     c->x[0] = a ? RO_OK : 0x1416u;               /* module 22, description 10: NotFound */
 }

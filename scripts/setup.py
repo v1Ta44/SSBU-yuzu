@@ -37,6 +37,7 @@ the one of a GitHub Release) the exe, SDL3.dll and ssbu_glslang.dll come from th
 dump are built here, with LLVM/clang 9 alone: no MSVC Build Tools, no Windows SDK, no SDL3 / Vulkan-Headers / glslang /
 suyu (RECOMP_NOCRT, tools/lifter/build.py). The package is used only by the tree it was built from (manifest.json).
 --nocrt builds the game libraries the same way without a package (the exe is then still linked here, with MSVC).
+Resource mods use upstream Skyline / ARCropolis; --with-latency-slider builds optional online delay controls.
 """
 import argparse
 import json
@@ -352,10 +353,21 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def check_runtime_features(cx):
+    """An upstream prebuilt host cannot acquire our source-only extensions."""
+    if getattr(cx.a, 'with_yuzu', False):
+        raise Fail('runtime package refused: Yuzu networking needs a host built from these sources; '
+                   'omit --runtime to build it here, or use --without-yuzu for the upstream runtime')
+    if getattr(cx.a, 'with_latency_slider', False):
+        raise Fail('runtime package refused: online delay controls need a host built from these sources; '
+                   'omit --runtime to build it here, or use --without-latency-slider for the upstream runtime')
+
+
 def load_runtime(cx, where):
     """The runtime package (folder or zip) -> its folder (a zip is unpacked into build/runtime), checked: every file against
     manifest.json, the tree digest and the game-data interface against this tree. Returns the manifest."""
     import zipfile
+    check_runtime_features(cx)
     where = os.path.abspath(where)
     if os.path.isfile(where):
         dst = os.path.join(cx.build, 'runtime')
@@ -440,6 +452,9 @@ def step_deps(cx):
     if missing:
         raise Fail('missing Python packages: %s   (pip install %s)' % (', '.join(missing), ' '.join(missing)))
     say('  python packages: numpy lz4 zstandard%s: ok' % ('' if a.runtime else ' Pillow unicorn'))
+    say('  resource loader: upstream Skyline / ARCropolis (docs/SKYLINE.md)')
+    say('  Yuzu networking: %s' % ('enabled (source host with ENet/Zstandard)' if a.with_yuzu else 'disabled'))
+    say('  online delay controls: %s' % ('enabled (MSVC and WebView2 SDK required)' if a.with_latency_slider else 'disabled'))
 
     deps = os.path.join(REPO, 'deps')
     def is_9(d):                                   # another LLVM version installed on the PC is not used unless asked for
@@ -1029,7 +1044,8 @@ def build_env(cx):
                       RECOMP_LIFT_JOBS=str(cx.lift_jobs))
     # FFMPEG_ROOT: build.py compiles the movie fallback (mf_ffmpeg.c) with the headers install.py put in deps\ffmpeg
     return cx.env(RECOMP_GEN='gen_eh_o2', RECOMP_OBJ='obj_eh_o1', RECOMP_DLL='ssbu_game_eh_o1.dll', RECOMP_NRO_SUFFIX='_eh_o2',
-                  RECOMP_INLINE=inline_flag(cx),
+                  RECOMP_INLINE=inline_flag(cx), RECOMP_YUZU='1' if cx.a.with_yuzu else '0',
+                  SSBU_NETWORK_DEPS=os.path.abspath(os.environ.get('SSBU_NETWORK_DEPS') or os.path.join(REPO, 'deps')),
                   FFMPEG_ROOT=os.environ.get('FFMPEG_ROOT') or os.path.join(REPO, 'deps', 'ffmpeg'))
 
 
@@ -1077,6 +1093,7 @@ def step_link(cx):
     if cx.mac:
         return link_mac(cx)
     if cx.runtime_dir:                        # the prebuilt runtime: copied and checked; only the game DLL is linked here
+        check_runtime_features(cx)
         cx.run('link', [sys.executable, 'build.py', 'gamedll'], env=cx.env(**{k: v for k, v in build_env(cx).items() if k != 'RECOMP_NRO_SUFFIX'}))
         with open(os.path.join(cx.runtime_dir, 'manifest.json')) as f:
             files = json.load(f)['files']
@@ -1100,8 +1117,16 @@ def step_link(cx):
         copy_ffmpeg(cx)
         copy_logo(cx)
         return
+    if cx.a.with_latency_slider:
+        if cx.state.get('game_version', '13.0.4') != '13.0.4':
+            raise Fail('online delay controls are verified for 13.0.4 only; use --without-latency-slider for 13.0.5')
+        try:
+            from .build_latency_slider import build_extension
+        except ImportError:
+            from build_latency_slider import build_extension
+        build_extension(cx.work, cx.tools['clang'], os.path.join(cx.bin, 'main.elf'))
     cx.run('link', [os.environ.get('COMSPEC', 'cmd.exe'), '/c', os.path.join(cx.work, 'build_glslang.bat')], env=cx.env())
-    cx.run('link', [sys.executable, 'build.py', 'link'], env=cx.env(**{k: v for k, v in build_env(cx).items() if k != 'RECOMP_NRO_SUFFIX'}, RECOMP_EXE=EXE))
+    cx.run('link', [sys.executable, 'build.py', 'link', '--with-yuzu' if cx.a.with_yuzu else '--without-yuzu', '--with-latency-slider' if cx.a.with_latency_slider else '--without-latency-slider'], env=cx.env(**{k: v for k, v in build_env(cx).items() if k != 'RECOMP_NRO_SUFFIX'}, RECOMP_EXE=EXE))
     exe = os.path.join(cx.work, EXE)
     for f in (EXE, 'SDL3.dll', 'ssbu_glslang.dll', 'ssbu_game_eh_o1.dll'):
         if not os.path.exists(os.path.join(cx.work, f)):
@@ -1114,6 +1139,7 @@ def step_link(cx):
                                                                                          ', ' + name if opus else ''))
     if not opus:
         say('  WARNING: no libopus: music and the other Opus sounds will be silent (deps step above; BUILDING.md)')
+    cx.state.setdefault('features', {}).update(resource_mods=False, skyline_loader=True, latency_slider=cx.a.with_latency_slider, yuzu_network=cx.a.with_yuzu, network_abi=1)
     copy_ffmpeg(cx)
     copy_logo(cx)
 
@@ -1276,7 +1302,18 @@ def main():
     ap.add_argument('--glslang', help='glslang windows-x86_64 release folder (include\\, lib\\)')
     ap.add_argument('--suyu', help='source checkout of a yuzu-family emulator (only src\\core\\hle\\service\\mii is read)')
     ap.add_argument('--opus', help='libopus DLL (opus.dll or libopus-0.dll) or the folder holding it: the music (optional, BUILDING.md)')
+    yuzu = ap.add_mutually_exclusive_group()
+    yuzu.add_argument('--with-yuzu', dest='with_yuzu', action='store_true', help='build Yuzu room compatibility (Windows source build; default on Windows)')
+    yuzu.add_argument('--without-yuzu', dest='with_yuzu', action='store_false', help='build only the upstream network implementation')
+    ap.set_defaults(with_yuzu=None)
     ap.add_argument('--imgui', help='Dear ImGui v1.91.9b source folder (imgui.h, imgui.cpp): the in-game settings menu (optional; BUILDING.md)')
+    mods = ap.add_mutually_exclusive_group()
+    mods.add_argument('--with-mods', action='store_true', help='retired; use upstream Skyline / ARCropolis')
+    mods.add_argument('--without-mods', dest='with_mods', action='store_false', help='compatibility option; upstream Skyline remains available')
+    delay = ap.add_mutually_exclusive_group()
+    delay.add_argument('--with-latency-slider', action='store_true', help='enable online delay slider and overlay (requires MSVC and WebView2 SDK)')
+    delay.add_argument('--without-latency-slider', dest='with_latency_slider', action='store_false', help='disable online delay controls (default; no extension dependencies)')
+    ap.set_defaults(with_mods=False, with_latency_slider=False)
     ap.add_argument('--sdk-roots', help='another list of SDK functions to lift (default: tools/lifter/sdklift_roots.txt)')
     ap.add_argument('--modules', help='script modules to build: all (default) or a comma list, e.g. lua2cpp_common,lua2cpp_mario')
     ap.add_argument('--runtime', help='prebuilt runtime package (zip or folder, scripts/make_release.py): the exe is not built here, '
@@ -1295,6 +1332,12 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help='check the tools and the dump (step deps), then list what would run')
     ap.add_argument('--status', action='store_true'), ap.add_argument('--steps', action='store_true'), ap.add_argument('--run', action='store_true')
     a = ap.parse_args()
+    if a.with_mods:
+        ap.error('--with-mods has been retired; see docs/SKYLINE.md for upstream Skyline / ARCropolis')
+    if a.with_yuzu is None:
+        a.with_yuzu = a.target == 'windows'
+    if a.with_yuzu and a.target != 'windows':
+        ap.error('--with-yuzu currently requires --target windows')
     if a.steps:
         say(' '.join(STEPS))
         return 0
@@ -1310,6 +1353,12 @@ def main():
     todo = STEPS
     done = cx.state.setdefault('done', {})
     force = set()
+    # Changing the feature must relink even when setup resumes a completed build.
+    if (cx.state.get('features', {}).get('resource_mods', False) is not False
+            or cx.state.get('features', {}).get('latency_slider', False) is not a.with_latency_slider
+            or cx.state.get('features', {}).get('yuzu_network', False) is not a.with_yuzu):
+        force.add('link')
+        done.pop('check', None)
     for opt in (a.redo, a.from_step, a.only):
         if opt and opt not in STEPS:
             say('unknown step %s (steps: %s)' % (opt, ' '.join(STEPS)))

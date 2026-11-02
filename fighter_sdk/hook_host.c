@@ -377,6 +377,38 @@ typedef struct {
 static void hk_log(const char *s) { printf("%s\n", s); trace_printf("%s\n", s); }
 static const HookApi g_hook_api = {sizeof(HookApi), 1, hook_install, hook_install_name, hook_remove, hook_enable, hook_calls, hook_address, call_indirect, hk_log, hook_error};
 
+#ifndef SSBU_ENABLE_NET_DELAY
+#define SSBU_ENABLE_NET_DELAY 0
+#endif
+static HMODULE g_delay_mod;
+static void hook_load_delay(void) {
+#if SSBU_ENABLE_NET_DELAY
+    wchar_t path[32768];
+    DWORD length = GetModuleFileNameW(NULL, path, 32768);
+    if (!length || length >= 32768) return;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    if (!_wgetenv(L"SSBU_NET_DELAY_CONFIG")) {
+        wchar_t config[32768];
+        *slash = 0;
+        int n = swprintf(config, 32768, L"%ls\\..\\config", path);
+        if (n < 0 || n >= 32768) return;
+        CreateDirectoryW(config, NULL);
+        n = swprintf(config, 32768, L"%ls\\..\\config\\online-delay.ini", path);
+        if (n < 0 || n >= 32768 || _wputenv_s(L"SSBU_NET_DELAY_CONFIG", config)) return;
+        *slash = L'\\';
+    }
+    const wchar_t *name = L"plugins\\latency_slider.dll";
+    size_t remaining = 32768 - (size_t)(slash + 1 - path);
+    if (wcslen(name) >= remaining) return;
+    wcscpy(slash + 1, name);
+    HMODULE dll = LoadLibraryW(path);
+    void (*init)(const HookApi *) = dll ? (void (*)(const HookApi *))(void *)GetProcAddress(dll, "mod_init") : NULL;
+    if (!init) { printf("net-delay: enabled extension missing (error %lu)\n", GetLastError()); if (dll) FreeLibrary(dll); return; }
+    g_delay_mod = dll;
+    init(&g_hook_api);
+#endif
+}
 static void hook_load_mods(void) {
     char dir[MAX_PATH * 2], pat[MAX_PATH * 2];
     const char *env = getenv("SSBU_MODS");
@@ -390,6 +422,13 @@ static void hook_load_mods(void) {
         char path[MAX_PATH * 3];
         snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
         HMODULE dll = LoadLibraryA(path);
+        if (dll && dll == g_delay_mod) { FreeLibrary(dll); continue; }
+#if !SSBU_ENABLE_NET_DELAY
+        if (dll && GetProcAddress(dll, "ssbu_delay_state")) {
+            printf("net-delay: disabled at build time; ignoring %s\n", path);
+            FreeLibrary(dll); continue;
+        }
+#endif
         void (*init)(const HookApi *) = dll ? (void (*)(const HookApi *))(void *)GetProcAddress(dll, "mod_init") : NULL;
         if (!init) { printf("mod: %s is not a mod (no mod_init)\n", path); if (dll) FreeLibrary(dll); continue; }
         int before = g_hk_layers;
@@ -625,5 +664,6 @@ static void hook_start(Ctx *c) {                       /* once, before the game 
     hook_count_start();
     hook_health_start();
     fighter_debug_start();
+    hook_load_delay();
     hook_load_mods();
 }
