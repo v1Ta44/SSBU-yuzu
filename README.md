@@ -21,7 +21,9 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 > The project is called **OpenSmash-Ultimate**. The repository is still named `Denkishi/ssbu-recomp`.
 
 
-## Yuzu 个人整合版
+## Yuzu 个人整合版 0.3.0
+
+当前稳定版本方案为 **0.3.0**，更新序号 **5**，详见[版本记录](docs/RELEASE_0.3.0_2026-11-03.md)。版本号与本地合入不代表线上更新通道已经发布。
 
 本分支在上游基础上提供个人使用的 Windows 便携版。`main` 保持上游原样，稳定版本放在 `yuzu`；下文的上游安装器与预编译宿主不用于更新这个便携版。已验证的游戏版本为 **13.0.4**，其余版本的个人扩展尚未验证。
 
